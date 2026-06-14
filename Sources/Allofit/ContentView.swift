@@ -52,7 +52,7 @@ struct ContentView: View {
 		HStack(spacing: 8) {
 			SearchField(
 				text: $model.query,
-				placeholder: "Search files…  e.g.  Start*.pdf",
+				placeholder: "Search files…  e.g.  Start*.pdf  ·  *.png | *.jpg",
 				initiallyFirstResponder: true
 			)
 			.frame(minHeight: 28)
