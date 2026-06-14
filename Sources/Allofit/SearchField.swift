@@ -71,7 +71,9 @@ struct SearchField: NSViewRepresentable {
 
 	// Coordinator bridges AppKit delegate callbacks to the SwiftUI binding,
 	// adds submitted queries to the recents list, and implements arrow-key
-	// navigation through the search history.
+	// navigation through the search history. @MainActor since AppKit invokes
+	// every delegate method on main.
+	@MainActor
 	final class Coordinator: NSObject, NSSearchFieldDelegate {
 
 		// strong reference back to the SearchField struct (rebound by updates)

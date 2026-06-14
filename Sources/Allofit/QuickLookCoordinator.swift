@@ -4,7 +4,8 @@ import Quartz
 // QuickLookCoordinator drives the system-wide QLPreviewPanel for the current
 // selection. It acts as both data source and delegate for the panel, which is
 // itself a process-wide singleton.
-final class QuickLookCoordinator: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+@MainActor
+final class QuickLookCoordinator: NSObject, @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
 
 	// singleton because QLPreviewPanel is itself a singleton
 	static let shared = QuickLookCoordinator()

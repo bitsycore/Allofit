@@ -488,7 +488,9 @@ final class AppModel: ObservableObject {
 		// Table - the previous .default mode paused during those windows.
 		cachePollTimer?.invalidate()
 		let vTimer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
-			self?.pollCacheForChanges()
+			// Timer closures aren't statically @MainActor; the runtime
+			// invokes them on whatever runloop hosts the timer (here, main)
+			Task { @MainActor in self?.pollCacheForChanges() }
 		}
 		RunLoop.main.add(vTimer, forMode: .common)
 		cachePollTimer = vTimer

@@ -29,7 +29,10 @@ struct FSChange {
 // The watcher can be started from a specific event id, which lets us "replay"
 // every change that occurred while the app was closed - the same fast-resume
 // trick Everything uses on Windows.
-final class FileWatcher {
+//
+// @unchecked Sendable because all mutable state is guarded by the internal
+// NSLock, and the C callback handles concurrency via that same lock.
+final class FileWatcher: @unchecked Sendable {
 
 	// callback signature receiving an array of change descriptors
 	typealias ChangeHandler = ([FSChange]) -> Void

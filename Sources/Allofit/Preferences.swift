@@ -11,7 +11,10 @@ import SwiftUI
 // the launchd plist. We detect that here and load the GUI user's plist file
 // directly (root has plain filesystem read access to ~/Library/Preferences,
 // no TCC involvement).
-final class Preferences: ObservableObject {
+// @unchecked Sendable because: writes flow through SwiftUI bindings (main
+// actor), and the daemon only reads after init - there is no concurrent
+// mutation. UserDefaults itself is thread-safe.
+final class Preferences: ObservableObject, @unchecked Sendable {
 
 	// shared singleton used by the GUI and the service runtime
 	static let shared = Preferences()

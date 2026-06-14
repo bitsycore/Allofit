@@ -10,6 +10,17 @@ import CoreServices
 // quietly instead of fighting for the cache file.
 enum AllofitService {
 
+	// Shared mutable state across the FSEvents callback queue and the
+	// autosave loop. Wrapped in a class so closures capture by reference
+	// and Swift 6's @Sendable closures can hold it cleanly. @unchecked
+	// Sendable because every access goes through the NSLock below.
+	private final class State: @unchecked Sendable {
+		var records: [FileRecord] = []
+		var pathIndex: [String: Int] = [:]
+		var dirty: Bool = false
+		let lock = NSLock()
+	}
+
 	// runs the indexer/watcher loop forever (never returns)
 	static func run() -> Never {
 		// ensure files we create are world-readable (root daemon writes the
@@ -37,11 +48,7 @@ enum AllofitService {
 			  vPrefs.excludedPaths.count,
 			  vPrefs.excludedPaths.joined(separator: ", "))
 
-		// shared mutable state guarded by vStateLock
-		var vRecords: [FileRecord] = []
-		var vPathIndex: [String: Int] = [:]
-		var vDirty = false
-		let vStateLock = NSLock()
+		let vState = State()
 
 		// initial scan: streaming the walker through the shared state lock so
 		// the autosave thread (every 3s) can write partial progress while we
@@ -51,23 +58,23 @@ enum AllofitService {
 		for vRoot in vRoots {
 			NSLog("[Allofit] scanning %@", vRoot.path)
 			FileIndexer.walkRoot(inRoot: vRoot, inExclusions: vMatcher) { vBatch in
-				vStateLock.lock()
+				vState.lock.lock()
 				for vRec in vBatch {
 					if vMatcher.isExcluded(inPath: vRec.fullPath) { continue }
-					if vPathIndex[vRec.fullPath] == nil {
-						vPathIndex[vRec.fullPath] = vRecords.count
-						vRecords.append(vRec)
+					if vState.pathIndex[vRec.fullPath] == nil {
+						vState.pathIndex[vRec.fullPath] = vState.records.count
+						vState.records.append(vRec)
 					}
 				}
-				vDirty = true
-				vStateLock.unlock()
+				vState.dirty = true
+				vState.lock.unlock()
 			}
-			NSLog("[Allofit] scanned %@: %d total entries so far", vRoot.path, vRecords.count)
+			NSLog("[Allofit] scanned %@: %d total entries so far", vRoot.path, vState.records.count)
 		}
 		// force one save right after the scan finishes, so the GUI sees a
 		// stable count even if no FSEvents come in for a while afterwards
-		IndexStore.save(inRecords: vRecords, inLastEventId: vStartId)
-		NSLog("[Allofit] initial scan complete (%d entries)", vRecords.count)
+		IndexStore.save(inRecords: vState.records, inLastEventId: vStartId)
+		NSLog("[Allofit] initial scan complete (%d entries)", vState.records.count)
 
 		// FSEvents watcher
 		let vWatcher = FileWatcher()
@@ -79,8 +86,8 @@ enum AllofitService {
 			NSLog("[Allofit] FSEvents batch: %d change(s) (sample: %@)",
 				  vChanges.count,
 				  vChanges.first?.path ?? "—")
-			vStateLock.lock()
-			defer { vStateLock.unlock() }
+			vState.lock.lock()
+			defer { vState.lock.unlock() }
 			var vRescanPrefixes: [String] = []
 			var vAdded = 0
 			var vUpdated = 0
@@ -95,32 +102,32 @@ enum AllofitService {
 				let vUrl = URL(fileURLWithPath: vChange.path)
 				let vExists = (try? vUrl.checkResourceIsReachable()) ?? false
 				if vExists, let vRec = FileIndexer.makeRecord(inURL: vUrl) {
-					if let vIdx = vPathIndex[vRec.fullPath] {
-						vRecords[vIdx] = vRec
+					if let vIdx = vState.pathIndex[vRec.fullPath] {
+						vState.records[vIdx] = vRec
 						vUpdated += 1
 					} else {
-						vPathIndex[vRec.fullPath] = vRecords.count
-						vRecords.append(vRec)
+						vState.pathIndex[vRec.fullPath] = vState.records.count
+						vState.records.append(vRec)
 						vAdded += 1
 					}
-				} else if let vIdx = vPathIndex[vChange.path] {
-					vRecords.remove(at: vIdx)
-					vPathIndex.removeAll(keepingCapacity: true)
-					for (vI, vR) in vRecords.enumerated() {
-						vPathIndex[vR.fullPath] = vI
+				} else if let vIdx = vState.pathIndex[vChange.path] {
+					vState.records.remove(at: vIdx)
+					vState.pathIndex.removeAll(keepingCapacity: true)
+					for (vI, vR) in vState.records.enumerated() {
+						vState.pathIndex[vR.fullPath] = vI
 					}
 					vRemovedCount += 1
 				}
 			}
 			if vAdded + vUpdated + vRemovedCount > 0 {
 				NSLog("[Allofit] applied: +%d / ~%d / -%d (total %d)",
-					  vAdded, vUpdated, vRemovedCount, vRecords.count)
+					  vAdded, vUpdated, vRemovedCount, vState.records.count)
 			}
 
 			if !vRescanPrefixes.isEmpty {
 				NSLog("[Allofit] rescanning \(vRescanPrefixes.count) subtree(s) (history lost)")
 				let vNormalized = vRescanPrefixes.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
-				vRecords.removeAll { vRec in
+				vState.records.removeAll { vRec in
 					let vP = vRec.fullPath
 					for vPre in vNormalized where vP == String(vPre.dropLast()) || vP.hasPrefix(vPre) {
 						return true
@@ -132,29 +139,27 @@ enum AllofitService {
 						inRoot: URL(fileURLWithPath: vPath),
 						inExclusions: vMatcher
 					)
-					vRecords.append(contentsOf: vList)
+					vState.records.append(contentsOf: vList)
 				}
-				vPathIndex.removeAll(keepingCapacity: true)
-				for (vI, vR) in vRecords.enumerated() {
-					vPathIndex[vR.fullPath] = vI
+				vState.pathIndex.removeAll(keepingCapacity: true)
+				for (vI, vR) in vState.records.enumerated() {
+					vState.pathIndex[vR.fullPath] = vI
 				}
 			}
 
-			vDirty = true
+			vState.dirty = true
 		}
 
 		// periodic save loop (background thread). 3-second check interval so
-		// new files appear in the GUI within a few seconds of being created,
-		// instead of the 30-second window the previous revision had which
-		// could read as "the service is not indexing new files".
+		// new files appear in the GUI within a few seconds of being created.
 		DispatchQueue.global(qos: .utility).async {
 			while true {
 				sleep(3)
-				vStateLock.lock()
-				let vShouldSave = vDirty
-				let vSnapshot = vRecords
-				vDirty = false
-				vStateLock.unlock()
+				vState.lock.lock()
+				let vShouldSave = vState.dirty
+				let vSnapshot = vState.records
+				vState.dirty = false
+				vState.lock.unlock()
 				if vShouldSave {
 					NSLog("[Allofit] autosaving %d records", vSnapshot.count)
 					IndexStore.save(

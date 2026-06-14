@@ -85,7 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// AppKit unhide every hidden window the app holds (Settings included).
 	// Strong, not weak, because SwiftUI tears down its content view tree on
 	// close - the weak ref would die and dock-click would silently no-op.
-	static var mainWindow: NSWindow?
+	// nonisolated(unsafe) because all reads/writes happen on the main thread
+	// (NSView callbacks + the AppKit delegate methods are all @MainActor).
+	nonisolated(unsafe) static var mainWindow: NSWindow?
 
 	// called once when the application has finished launching
 	func applicationDidFinishLaunching(_ notification: Notification) {

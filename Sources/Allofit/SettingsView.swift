@@ -506,7 +506,8 @@ private struct DiagnosticsTab: View {
 	// We use the lock file (world-readable on /Library/.../indexer.lock)
 	// instead of `launchctl print system/...` because the latter needs root
 	// and would require a password prompt every refresh.
-	private static func computeDaemonStatus(inMode: Preferences.ServiceMode) async -> String {
+	// nonisolated so the detached Task can call without an actor hop.
+	private nonisolated static func computeDaemonStatus(inMode: Preferences.ServiceMode) async -> String {
 		let vLockPath: String
 		switch inMode {
 			case .none:
@@ -531,7 +532,7 @@ private struct DiagnosticsTab: View {
 	}
 
 	// reads the last 30 lines of the service stderr log file
-	private static func readLogTail() -> String {
+	private nonisolated static func readLogTail() -> String {
 		let vPath = "/tmp/allofit-service.err"
 		guard let vData = try? Data(contentsOf: URL(fileURLWithPath: vPath)),
 			  let vText = String(data: vData, encoding: .utf8)

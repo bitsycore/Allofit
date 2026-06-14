@@ -13,7 +13,9 @@ import UniformTypeIdentifiers
 enum IconCache {
 
 	// extension (lowercased) or sentinel key -> cached icon
-	private static var cache: [String: NSImage] = [:]
+	// nonisolated(unsafe) because all access is serialized through the lock
+	// below - Swift's static-isolation check can't see that, so we vouch.
+	nonisolated(unsafe) private static var cache: [String: NSImage] = [:]
 	// guard for cache access (Table renderers may run on multiple threads)
 	private static let lock = NSLock()
 
