@@ -4,7 +4,7 @@ import Foundation
 // command-line arguments: --service starts the headless indexer/watcher
 // daemon, anything else launches the SwiftUI GUI application.
 @main
-enum Main {
+struct Main {
 	static func main() {
 		if CommandLine.arguments.contains("--service") {
 			AllofitService.run()

@@ -1,0 +1,62 @@
+name: Release
+
+# Fires on any tag push. Both `0.0.1` and `v0.0.1` style tags work - the
+# build step strips the optional leading 'v' before stamping the Info.plist.
+on:
+  push:
+    tags:
+      - '*'
+
+# Needed for softprops/action-gh-release to create / upload to releases
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build .app and publish release
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcodebuild -version
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Building Allofit ${version} from tag ${tag}"
+
+      - name: Build Allofit.app
+        env:
+          ALLOFIT_VERSION: ${{ steps.version.outputs.version }}
+          ALLOFIT_BUILD: ${{ github.run_number }}
+        run: ./build-app.sh
+
+      - name: Zip Allofit.app (ditto preserves bundle metadata + signatures)
+        run: |
+          ditto -c -k --keepParent --sequesterRsrc \
+            Allofit.app \
+            "Allofit-${{ steps.version.outputs.tag }}.zip"
+
+      - name: SHA-256 checksum
+        run: shasum -a 256 "Allofit-${{ steps.version.outputs.tag }}.zip" | tee Allofit-${{ steps.version.outputs.tag }}.zip.sha256
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Allofit ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            Allofit-${{ steps.version.outputs.tag }}.zip
+            Allofit-${{ steps.version.outputs.tag }}.zip.sha256

@@ -8,8 +8,10 @@ set -euo pipefail
 
 kAppName="Allofit"
 kBundleId="com.bitsycore.allofit"
-kVersion="1.0"
-kBuildNumber="1"
+# version + build can be overridden from CI so the release tag flows into
+# the .app's Info.plist. Default to "0.0.0" / "0" for local dev builds.
+kVersion="${ALLOFIT_VERSION:-0.0.0}"
+kBuildNumber="${ALLOFIT_BUILD:-0}"
 
 vProjectRoot="$(cd "$(dirname "$0")" && pwd)"
 vAppBundle="${vProjectRoot}/${kAppName}.app"
