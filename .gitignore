@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# Xcode (if anyone opens the package in Xcode)
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# Build output produced by ./build-app.sh
+Allofit.app/
+
+# Service log files (also live in /tmp but local copies happen during dev)
+allofit-service.log
+allofit-service.err
