@@ -16,3 +16,6 @@ Allofit.app/
 # Service log files (also live in /tmp but local copies happen during dev)
 allofit-service.log
 allofit-service.err
+
+
+.idea/
