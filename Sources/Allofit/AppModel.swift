@@ -2,6 +2,27 @@ import Foundation
 import SwiftUI
 import CoreServices
 
+// Background-thread-safe last-seen-mtime cell for the cache-file poll.
+// Lets the DispatchSource timer compare a new stat() result against the
+// previously seen value without touching any @MainActor state, so the
+// poll only hops to main when the cache has actually changed on disk.
+private final class BackgroundMtime: @unchecked Sendable {
+	private var mtime: Date?
+	private let lock = NSLock()
+
+	// returns true if the supplied mtime differs from the stored value
+	// (and updates the stored value), false otherwise
+	func updateIfChanged(_ inMtime: Date) -> Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		if mtime != inMtime {
+			mtime = inMtime
+			return true
+		}
+		return false
+	}
+}
+
 // AppModel is the central observable state for the application.
 // It owns the in-memory file index, drives the background indexer and the
 // FSEvents watcher, debounces the search query and exposes a filtered/sorted
@@ -80,8 +101,11 @@ final class AppModel: ObservableObject {
 	// last user-facing status string for the Settings buttons
 	@Published private(set) var workMessage: String = ""
 	// polling backup for reader-mode cache changes; FSEvents alone can miss
-	// updates if the watched directory didn't exist when the stream started
-	private var cachePollTimer: Timer?
+	// updates if the watched directory didn't exist when the stream started.
+	// Uses DispatchSourceTimer on a background queue (not Timer on the main
+	// runloop) so the periodic stat() doesn't compete with NSTableView click
+	// handling - main-runloop timers were the source of dropped clicks.
+	private var cachePollSource: DispatchSourceTimer?
 	// last mtime we observed on the cache file - skips needless reloads
 	private var lastSeenCacheMtime: Date?
 	// minimum gap between two reader-mode reloads. Prevents the Table from
@@ -124,8 +148,8 @@ final class AppModel: ObservableObject {
 		cacheWatcher.stop()
 		autosaveTimer?.invalidate()
 		autosaveTimer = nil
-		cachePollTimer?.invalidate()
-		cachePollTimer = nil
+		cachePollSource?.cancel()
+		cachePollSource = nil
 		indexerLock?.unlock()
 		indexerLock = nil
 		filterTask?.cancel()
@@ -491,20 +515,28 @@ final class AppModel: ObservableObject {
 				}
 			}
 		}
-		// Polling backup at 2s intervals. FSEvents can silently no-op when
-		// the watched dir didn't exist at stream creation, or under sandbox
-		// restrictions. The stat() is cheap; reload only fires on mtime change.
-		// Register on .common runloop mode so the timer keeps firing even
-		// when SwiftUI is mid-update or the user is interacting with the
-		// Table - the previous .default mode paused during those windows.
-		cachePollTimer?.invalidate()
-		let vTimer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
-			// Timer closures aren't statically @MainActor; the runtime
-			// invokes them on whatever runloop hosts the timer (here, main)
-			Task { @MainActor in self?.pollCacheForChanges() }
+		// Background-queue polling backup at 2s. The stat() runs off main,
+		// and a lock-guarded background-side mtime tracker means we ONLY
+		// hop to main when the cache actually changed - the steady state
+		// puts zero work on the main runloop, leaving NSTableView's click
+		// handling uninterrupted.
+		cachePollSource?.cancel()
+		let vPolledPath = vUrl.path
+		let vBgMtime = BackgroundMtime()  // captured by the closure
+		let vSource = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+		vSource.schedule(deadline: .now() + 2.0, repeating: 2.0)
+		vSource.setEventHandler { [weak self] in
+			guard let vAttrs = try? FileManager.default.attributesOfItem(atPath: vPolledPath),
+				  let vMtime = vAttrs[.modificationDate] as? Date
+			else { return }
+			// Background-side change detection; only proceeds when mtime moved
+			guard vBgMtime.updateIfChanged(vMtime) else { return }
+			DispatchQueue.main.async {
+				self?.reloadFromCache()
+			}
 		}
-		RunLoop.main.add(vTimer, forMode: .common)
-		cachePollTimer = vTimer
+		vSource.resume()
+		cachePollSource = vSource
 	}
 
 	// stat()'s the cache file and triggers a reload when mtime changes
@@ -626,7 +658,14 @@ final class AppModel: ObservableObject {
 			// on the next runloop tick, avoiding NSTableView reentrance when
 			// the search field is mid-edit
 			DispatchQueue.main.async {
-				self?.visibleRecords = vCapped
+				guard let vSelf = self else { return }
+				// Skip the @Published fire when the resulting list is byte-
+				// for-byte identical to what the Table is already showing.
+				// Full FileRecord equality catches mtime / size updates, so
+				// we only skip true no-op reassignments. Clicks landing on
+				// the Table during a no-op reload no longer get dropped.
+				if vSelf.visibleRecords == vCapped { return }
+				vSelf.visibleRecords = vCapped
 			}
 		}
 	}

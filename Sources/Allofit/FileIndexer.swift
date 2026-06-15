@@ -96,9 +96,14 @@ enum FileIndexer {
 		return vRecords
 	}
 
-	// builds a FileRecord from a URL's pre-fetched resource values
+	// builds a FileRecord from a URL's pre-fetched resource values.
+	// Clears the URL's resource-value cache first so we always re-stat the
+	// file - a file modified between two FSEvents batches would otherwise
+	// silently return the cached pre-edit mtime.
 	static func makeRecord(inURL: URL) -> FileRecord? {
-		guard let vValues = try? inURL.resourceValues(forKeys: Set(kPrefetchKeys)) else {
+		var vUrl = inURL
+		vUrl.removeAllCachedResourceValues()
+		guard let vValues = try? vUrl.resourceValues(forKeys: Set(kPrefetchKeys)) else {
 			return nil
 		}
 		let vName = vValues.name ?? inURL.lastPathComponent

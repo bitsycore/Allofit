@@ -4,45 +4,79 @@
 # with the .app and an /Applications symlink so the user can drag-install.
 #
 # Usage:
-#     ./build-dmg.sh                 # rebuilds the .app first, then DMGs it
-#     ./build-dmg.sh --skip-build    # assumes Allofit.app already exists
-#     ALLOFIT_VERSION=1.0.0 ./build-dmg.sh
+#     ./build-dmg.sh                          # default version (0.0.0)
+#     ./build-dmg.sh --version 1.0.0          # explicit version
+#     ./build-dmg.sh -v 1.0.0 --skip-build    # version + skip rebuild
+#     ALLOFIT_VERSION=1.0.0 ./build-dmg.sh    # env var still works
 #
+# Version precedence: --version arg > ALLOFIT_VERSION env > default 0.0.0.
 # Output: Allofit-<version>.dmg in the project root.
 set -euo pipefail
 
 kAppName="Allofit"
-kVersion="${ALLOFIT_VERSION:-0.0.0}"
 
 vProjectRoot="$(cd "$(dirname "$0")" && pwd)"
 vAppBundle="${vProjectRoot}/${kAppName}.app"
-vDmgPath="${vProjectRoot}/${kAppName}-${kVersion}.dmg"
 vStagingDir="${vProjectRoot}/.build/dmg-staging"
 
+# ==================
+# MARK: Args
+# ==================
+
 vSkipBuild=0
-for vArg in "$@"; do
-	case "$vArg" in
-		--skip-build) vSkipBuild=1 ;;
+vVersionArg=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--version|-v)
+			if [[ $# -lt 2 ]]; then
+				echo "$1 requires a value" >&2
+				exit 1
+			fi
+			vVersionArg="$2"
+			shift 2
+			;;
+		--skip-build)
+			vSkipBuild=1
+			shift
+			;;
 		-h|--help)
 			sed -n '2,/^set /p' "$0" | sed -E 's/^#( |$)//;/^set /d'
 			exit 0
 			;;
 		*)
-			echo "Unknown argument: $vArg" >&2
+			echo "Unknown argument: $1" >&2
 			exit 1
 			;;
 	esac
 done
 
+# version precedence: --version arg > env var > default
+if [[ -n "$vVersionArg" ]]; then
+	kVersion="$vVersionArg"
+else
+	kVersion="${ALLOFIT_VERSION:-0.0.0}"
+fi
+vDmgPath="${vProjectRoot}/${kAppName}-${kVersion}.dmg"
+
+# ==================
+# MARK: Build .app
+# ==================
+
 if [[ "$vSkipBuild" -eq 0 ]]; then
 	echo "==> Rebuilding ${kAppName}.app first"
-	"${vProjectRoot}/build-app.sh"
+	# Propagate the resolved version into build-app.sh so the bundled
+	# Info.plist matches what we're naming the DMG.
+	ALLOFIT_VERSION="${kVersion}" "${vProjectRoot}/build-app.sh"
 fi
 
 if [[ ! -d "${vAppBundle}" ]]; then
 	echo "Run ./build-app.sh first - ${kAppName}.app is missing" >&2
 	exit 1
 fi
+
+# ==================
+# MARK: Stage + create DMG
+# ==================
 
 echo "==> Staging DMG contents"
 rm -rf "${vStagingDir}"

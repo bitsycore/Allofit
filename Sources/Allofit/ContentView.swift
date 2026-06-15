@@ -2,45 +2,59 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-// ContentView is the main window layout: search bar at the top, a results
-// table that mirrors the look of Everything, and a status bar at the bottom.
+// ContentView is the main window layout: a search bar bonded to the title
+// bar via `.background(.bar)` (Liquid Glass on macOS 26, vibrant material
+// on macOS 15), a results table that fills the body, and a status bar at
+// the bottom. The Settings gear sits permanently in the window toolbar.
 struct ContentView: View {
 
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var prefs: Preferences
 	@State private var selection: Set<FileRecord.ID> = []
-	// SwiftUI Table sort order - clicking a column header updates this
-	@State private var sortOrder: [KeyPathComparator<FileRecord>] = [
-		KeyPathComparator(\FileRecord.name, order: .forward)
-	]
+	// drives the Table's drag-to-reorder and column-visibility customization
+	@State private var columnCustomization: TableColumnCustomization<FileRecord> = TableColumnCustomization()
 
-	var body: some View {
-		VStack(spacing: 0) {
-			searchBar
-			Divider()
-			resultsTable
-			Divider()
-			statusBar
-		}
-		.onAppear {
-			// align Table sort order with the persisted sort descriptor
-			sortOrder = [Self.comparatorFor(inDescriptor: model.sortDescriptor)]
-			model.start()
-		}
-		.onDisappear {
-			model.saveCache()
-		}
-		.onChange(of: sortOrder) { _, vNew in
-			if let vFirst = vNew.first {
-				// defer to the next runloop tick so we don't write back into
-				// the model while NSTableView is still in its sort delegate
-				// callback - that triggers the "reentrant operation in its
-				// NSTableView delegate" warning from AppKit
+	// Computed binding for the Table's sortOrder: reads/writes
+	// model.sortDescriptor directly so the sort state survives any number
+	// of window closes / reopens (the previous `@State sortOrder` got
+	// reset whenever the view was recreated, and the onChange-syncing
+	// dance occasionally didn't re-wire properly after a window reopen).
+	private var sortOrderBinding: Binding<[KeyPathComparator<FileRecord>]> {
+		Binding(
+			get: { [Self.comparatorFor(inDescriptor: model.sortDescriptor)] },
+			set: { vNewOrder in
+				guard let vFirst = vNewOrder.first else { return }
 				let vDescriptor = Self.mapSortOrder(inComparator: vFirst)
+				// defer one runloop tick so we don't write back into the
+				// model while NSTableView is still in its sort delegate
+				// callback (avoids the reentrant-operation AppKit warning)
 				DispatchQueue.main.async {
 					model.sortDescriptor = vDescriptor
 				}
 			}
+		)
+	}
+
+	var body: some View {
+		VStack(spacing: 0) {
+			searchBar
+			resultsTable
+			Divider()
+			statusBar
+		}
+		.toolbar {
+			ToolbarItem(placement: .primaryAction) {
+				SettingsLink {
+					Image(systemName: "gearshape")
+				}
+				.help("Preferences (⌘,)")
+			}
+		}
+		.onAppear {
+			model.start()
+		}
+		.onDisappear {
+			model.saveCache()
 		}
 	}
 
@@ -48,22 +62,20 @@ struct ContentView: View {
 	// MARK: Search bar
 	// ===========================
 
+	// Always-visible row at the top. `.background(.bar)` uses the system
+	// "bar" material, which sits right below the toolbar with the same
+	// vibrancy treatment - on macOS 26 this is the Liquid Glass surface,
+	// on macOS 15 it's the standard chrome material.
 	private var searchBar: some View {
-		HStack(spacing: 8) {
-			SearchField(
-				text: $model.query,
-				placeholder: "Search files…  e.g.  Start*.pdf  ·  *.png | *.jpg",
-				initiallyFirstResponder: true
-			)
-			.frame(minHeight: 28)
-
-			SettingsLink {
-				Image(systemName: "gearshape")
-			}
-			.help("Preferences (⌘,)")
-		}
+		SearchField(
+			text: $model.query,
+			placeholder: "Search files…  e.g.  Start*.pdf  ·  *.png | *.jpg",
+			initiallyFirstResponder: true
+		)
+		.frame(minHeight: 24)
 		.padding(.horizontal, 12)
 		.padding(.vertical, 8)
+		.background(.bar)
 	}
 
 	// ===========================
@@ -71,7 +83,16 @@ struct ContentView: View {
 	// ===========================
 
 	private var resultsTable: some View {
-		Table(model.visibleRecords, selection: $selection, sortOrder: $sortOrder) {
+		// columnCustomization binding enables drag-to-reorder column headers
+		// and right-click → show/hide column. The customizationID per column
+		// is how the Table identifies columns across reorder operations.
+		// sortOrderBinding reads/writes model.sortDescriptor so the column
+		// sort survives window close/reopen and stays in sync after a
+		// programmatic sort change.
+		Table(model.visibleRecords,
+			  selection: $selection,
+			  sortOrder: sortOrderBinding,
+			  columnCustomization: $columnCustomization) {
 			TableColumn("Name", value: \FileRecord.name) { vRecord in
 				HStack(spacing: 6) {
 					Image(nsImage: IconCache.icon(
@@ -86,6 +107,7 @@ struct ContentView: View {
 				.draggable(URL(fileURLWithPath: vRecord.fullPath))
 			}
 			.width(min: 200, ideal: 320)
+			.customizationID("name")
 
 			TableColumn("Path", value: \FileRecord.parentPath) { vRecord in
 				Text(vRecord.parentPath)
@@ -94,6 +116,7 @@ struct ContentView: View {
 					.lineLimit(1)
 			}
 			.width(min: 200, ideal: 380)
+			.customizationID("path")
 
 			TableColumn("Size", value: \FileRecord.size) { vRecord in
 				Text(vRecord.isDirectory ? "—" : Self.formatSize(inBytes: vRecord.size))
@@ -101,6 +124,7 @@ struct ContentView: View {
 					.monospacedDigit()
 			}
 			.width(90)
+			.customizationID("size")
 
 			TableColumn("Created", value: \FileRecord.dateCreated) { vRecord in
 				Text(Self.formatDate(inDate: vRecord.dateCreated))
@@ -108,6 +132,7 @@ struct ContentView: View {
 					.monospacedDigit()
 			}
 			.width(140)
+			.customizationID("created")
 
 			TableColumn("Modified", value: \FileRecord.dateModified) { vRecord in
 				Text(Self.formatDate(inDate: vRecord.dateModified))
@@ -115,6 +140,7 @@ struct ContentView: View {
 					.monospacedDigit()
 			}
 			.width(140)
+			.customizationID("modified")
 		}
 		.contextMenu(forSelectionType: FileRecord.ID.self) { vIds in
 			Button("Open") { openSelection(inIds: vIds) }
