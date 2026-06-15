@@ -4,6 +4,14 @@
 # /Applications, etc.). Run from the project root:
 #     ./build-app.sh
 # The produced bundle ends up at ./Allofit.app
+#
+# Icon support (optional, first match wins):
+#     icons/Allofit.icns          - pre-built .icns, copied straight in
+#     icons/Allofit.iconset/      - Apple iconset dir, fed to iconutil
+#     icons/icon.png              - single PNG (ideally 1024x1024), resized
+#                                   to every required slot via sips
+# If no icon source exists the bundle is built without one (Finder shows
+# the generic executable icon).
 set -euo pipefail
 
 kAppName="Allofit"
@@ -18,6 +26,11 @@ vAppBundle="${vProjectRoot}/${kAppName}.app"
 vMacOSDir="${vAppBundle}/Contents/MacOS"
 vResourcesDir="${vAppBundle}/Contents/Resources"
 vBinarySrc="${vProjectRoot}/.build/release/${kAppName}"
+vIconStagingDir="${vProjectRoot}/.build/icon-staging"
+
+# ==================
+# MARK: Build binary
+# ==================
 
 echo "==> Building release binary"
 ( cd "${vProjectRoot}" && swift build -c release )
@@ -27,11 +40,83 @@ if [[ ! -f "${vBinarySrc}" ]]; then
 	exit 1
 fi
 
+# ==================
+# MARK: Prepare bundle
+# ==================
+
 echo "==> Assembling ${kAppName}.app"
 rm -rf "${vAppBundle}"
 mkdir -p "${vMacOSDir}" "${vResourcesDir}"
 cp "${vBinarySrc}" "${vMacOSDir}/${kAppName}"
 chmod +x "${vMacOSDir}/${kAppName}"
+
+# ==================
+# MARK: Resolve icon
+# ==================
+
+# Locates an icon source in icons/ and emits an .icns into the bundle.
+# Echoes the basename (without extension) when one was installed; nothing
+# otherwise. Caller uses the result to fill CFBundleIconFile / CFBundleIconName.
+vBuiltIconName=""
+vIcnsSrc="${vProjectRoot}/icons/${kAppName}.icns"
+vIconsetSrc="${vProjectRoot}/icons/${kAppName}.iconset"
+vPngSrc="${vProjectRoot}/icons/icon.png"
+
+if [[ -f "${vIcnsSrc}" ]]; then
+	echo "==> Using pre-built icon ${vIcnsSrc}"
+	cp "${vIcnsSrc}" "${vResourcesDir}/${kAppName}.icns"
+	vBuiltIconName="${kAppName}"
+elif [[ -d "${vIconsetSrc}" ]]; then
+	echo "==> Building .icns from iconset ${vIconsetSrc}"
+	iconutil -c icns "${vIconsetSrc}" -o "${vResourcesDir}/${kAppName}.icns"
+	vBuiltIconName="${kAppName}"
+elif [[ -f "${vPngSrc}" ]]; then
+	echo "==> Building .icns from ${vPngSrc} (multi-size resample)"
+	rm -rf "${vIconStagingDir}"
+	mkdir -p "${vIconStagingDir}/${kAppName}.iconset"
+	# (pt-size, pixel-size, filename) tuples per Apple's iconset spec
+	vSlots=(
+		"16  16   icon_16x16.png"
+		"16  32   icon_16x16@2x.png"
+		"32  32   icon_32x32.png"
+		"32  64   icon_32x32@2x.png"
+		"128 128  icon_128x128.png"
+		"128 256  icon_128x128@2x.png"
+		"256 256  icon_256x256.png"
+		"256 512  icon_256x256@2x.png"
+		"512 512  icon_512x512.png"
+		"512 1024 icon_512x512@2x.png"
+	)
+	for vRow in "${vSlots[@]}"; do
+		read -r _ vPixels vFile <<<"${vRow}"
+		sips -z "${vPixels}" "${vPixels}" \
+			"${vPngSrc}" \
+			--out "${vIconStagingDir}/${kAppName}.iconset/${vFile}" \
+			>/dev/null
+	done
+	iconutil -c icns \
+		"${vIconStagingDir}/${kAppName}.iconset" \
+		-o "${vResourcesDir}/${kAppName}.icns"
+	vBuiltIconName="${kAppName}"
+else
+	echo "==> No icon source found in icons/ (skipping)"
+fi
+
+# ==================
+# MARK: Info.plist
+# ==================
+
+# Optional icon block - only emitted when an .icns was actually placed
+vIconPlistEntry=""
+if [[ -n "${vBuiltIconName}" ]]; then
+	vIconPlistEntry=$(cat <<EOF
+	<key>CFBundleIconFile</key>
+	<string>${vBuiltIconName}</string>
+	<key>CFBundleIconName</key>
+	<string>${vBuiltIconName}</string>
+EOF
+)
+fi
 
 cat > "${vAppBundle}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,6 +141,7 @@ cat > "${vAppBundle}/Contents/Info.plist" <<EOF
 	<string>${kVersion}</string>
 	<key>CFBundleVersion</key>
 	<string>${kBuildNumber}</string>
+${vIconPlistEntry}
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>NSHighResolutionCapable</key>
