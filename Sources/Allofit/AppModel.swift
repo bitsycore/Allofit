@@ -506,13 +506,17 @@ final class AppModel: ObservableObject {
 		let vDir = vUrl.deletingLastPathComponent().path
 		let vTarget = vUrl.path
 		NSLog("[Allofit GUI] reader mode: watching cache at %@", vTarget)
-		// FSEvents-based watcher for low-latency updates
+		// FSEvents-based watcher for low-latency updates. We watch the
+		// parent dir (FSEvents needs a real path) but only fire the reload
+		// when the cache file itself changed - other files in the dir
+		// (indexer.lock, .tmp atomic-rename leftovers, etc.) used to also
+		// trigger main.async hops, which contributed to dropped clicks.
 		cacheWatcher.start(inRoots: [vDir]) { vChanges in
-			if vChanges.contains(where: { $0.path == vTarget || $0.path == vDir }) {
-				NSLog("[Allofit GUI] cache file changed (FSEvents), reloading")
-				DispatchQueue.main.async { [weak self] in
-					self?.reloadFromCache()
-				}
+			let vCacheChanged = vChanges.contains(where: { $0.path == vTarget })
+			guard vCacheChanged else { return }
+			NSLog("[Allofit GUI] cache file changed (FSEvents), reloading")
+			DispatchQueue.main.async { [weak self] in
+				self?.reloadFromCache()
 			}
 		}
 		// Background-queue polling backup at 2s. The stat() runs off main,

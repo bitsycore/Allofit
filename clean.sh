@@ -147,7 +147,20 @@ fi
 
 if [[ -f "$kServiceLogStdout" || -f "$kServiceLogStderr" ]]; then
 	echo "==> Removing service log files"
-	vRun rm -f "$kServiceLogStdout" "$kServiceLogStderr"
+	# /tmp has the sticky bit, so only the file's owner can rm it. Logs
+	# left over from a previous *root* daemon run are owned by root - we
+	# need sudo to delete them. Plain rm for user-owned logs (user agent
+	# mode), sudo rm for root-owned ones.
+	for vLog in "$kServiceLogStdout" "$kServiceLogStderr"; do
+		if [[ -f "$vLog" ]]; then
+			if [[ -O "$vLog" ]]; then
+				vRun rm -f "$vLog"
+			else
+				vNeedsSudo
+				vRun sudo rm -f "$vLog"
+			fi
+		fi
+	done
 fi
 
 # ==================

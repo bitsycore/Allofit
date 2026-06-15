@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 // ContentView is the main window layout: a search bar bonded to the title
 // bar via `.background(.bar)` (Liquid Glass on macOS 26, vibrant material
@@ -11,8 +10,17 @@ struct ContentView: View {
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var prefs: Preferences
 	@State private var selection: Set<FileRecord.ID> = []
-	// drives the Table's drag-to-reorder and column-visibility customization
-	@State private var columnCustomization: TableColumnCustomization<FileRecord> = TableColumnCustomization()
+	// drives the Table's drag-to-reorder and column-visibility customization.
+	// Initial value is hydrated from UserDefaults so the user's column order
+	// survives app launches; subsequent changes flow back via .onChange.
+	@State private var columnCustomization: TableColumnCustomization<FileRecord> = ContentView.loadColumnCustomization()
+	// debounced background save task for columnCustomization changes.
+	// Cancelled+rescheduled per change so a drag (which fires onChange on
+	// every micro-update) only runs JSONEncoder once, off-main.
+	@State private var columnSaveTask: Task<Void, Never>?
+
+	private nonisolated static let kColumnCustomizationKey = "Allofit.columnCustomization"
+	private nonisolated static let kColumnSaveDebounceNanos: UInt64 = 300_000_000
 
 	// Computed binding for the Table's sortOrder: reads/writes
 	// model.sortDescriptor directly so the sort state survives any number
@@ -40,7 +48,8 @@ struct ContentView: View {
 			searchBar
 			resultsTable
 			Divider()
-			statusBar
+			StatusBarView()  // isolated so its @Published refresh
+							 // doesn't re-evaluate the Table closure
 		}
 		.toolbar {
 			ToolbarItem(placement: .primaryAction) {
@@ -56,6 +65,46 @@ struct ContentView: View {
 		.onDisappear {
 			model.saveCache()
 		}
+		.onChange(of: columnCustomization) { _, vNew in
+			// Debounced + off-main save. SwiftUI fires onChange on every
+			// micro-update during a column drag - encoding synchronously
+			// on main here would freeze the drag delegate. Cancel any
+			// pending task and reschedule so we encode at most once per
+			// drag (300 ms after the user lets go).
+			columnSaveTask?.cancel()
+			columnSaveTask = Task.detached(priority: .utility) {
+				try? await Task.sleep(nanoseconds: Self.kColumnSaveDebounceNanos)
+				if Task.isCancelled { return }
+				ContentView.saveColumnCustomization(vNew)
+			}
+		}
+	}
+
+	// ===========================
+	// MARK: Column customization persistence
+	// ===========================
+
+	// loads the previously-saved column order/visibility from UserDefaults,
+	// or returns a fresh default if nothing was saved or decoding fails
+	private static func loadColumnCustomization() -> TableColumnCustomization<FileRecord> {
+		guard let vData = UserDefaults.standard.data(forKey: kColumnCustomizationKey),
+			  let vCustom = try? JSONDecoder().decode(
+				TableColumnCustomization<FileRecord>.self,
+				from: vData
+			  )
+		else {
+			return TableColumnCustomization<FileRecord>()
+		}
+		return vCustom
+	}
+
+	// persists the current column order/visibility to UserDefaults.
+	// nonisolated so the debounced background task can call it without an
+	// actor hop - the encode is the only non-trivial step and we want it
+	// genuinely off-main during column drags.
+	private nonisolated static func saveColumnCustomization(_ inValue: TableColumnCustomization<FileRecord>) {
+		guard let vData = try? JSONEncoder().encode(inValue) else { return }
+		UserDefaults.standard.set(vData, forKey: kColumnCustomizationKey)
 	}
 
 	// ===========================
@@ -83,13 +132,17 @@ struct ContentView: View {
 	// ===========================
 
 	private var resultsTable: some View {
-		// columnCustomization binding enables drag-to-reorder column headers
-		// and right-click → show/hide column. The customizationID per column
-		// is how the Table identifies columns across reorder operations.
-		// sortOrderBinding reads/writes model.sortDescriptor so the column
-		// sort survives window close/reopen and stays in sync after a
-		// programmatic sort change.
-		Table(model.visibleRecords,
+		// Uses the explicit `rows:` form of Table so we can attach `.draggable`
+		// to TableRow rather than to cell content. Putting `.draggable` on
+		// cell content installs a SwiftUI drag-gesture recognizer that
+		// competes with NSTableView's mouseDown → selection event on
+		// macOS 26 - the recognizer's "should this be a drag?" decision
+		// delays and occasionally eats the click, leaving the row never
+		// selected even though right-click (which bypasses the drag gesture
+		// entirely) still works. Row-level `.draggable` puts the drag at
+		// the same scope as NSTableView's own row-drag machinery and leaves
+		// the click path clean.
+		Table(of: FileRecord.self,
 			  selection: $selection,
 			  sortOrder: sortOrderBinding,
 			  columnCustomization: $columnCustomization) {
@@ -104,7 +157,6 @@ struct ContentView: View {
 					Text(vRecord.name)
 						.lineLimit(1)
 				}
-				.draggable(URL(fileURLWithPath: vRecord.fullPath))
 			}
 			.width(min: 200, ideal: 320)
 			.customizationID("name")
@@ -141,6 +193,11 @@ struct ContentView: View {
 			}
 			.width(140)
 			.customizationID("modified")
+		} rows: {
+			ForEach(model.visibleRecords) { vRecord in
+				TableRow(vRecord)
+					.draggable(URL(fileURLWithPath: vRecord.fullPath))
+			}
 		}
 		.contextMenu(forSelectionType: FileRecord.ID.self) { vIds in
 			Button("Open") { openSelection(inIds: vIds) }
@@ -151,37 +208,6 @@ struct ContentView: View {
 		} primaryAction: { vIds in
 			openSelection(inIds: vIds)
 		}
-	}
-
-	// ===========================
-	// MARK: Status bar
-	// ===========================
-
-	private var statusBar: some View {
-		HStack(spacing: 8) {
-			if model.isIndexing {
-				ProgressView()
-					.controlSize(.small)
-				Text("Indexing…  \(model.indexedCount) entries")
-			} else {
-				Text("\(model.visibleRecords.count) shown  ·  \(model.indexedCount) indexed")
-			}
-			Spacer()
-			Text(model.isIndexer ? "Indexer" : "Reader")
-				.foregroundColor(.secondary)
-			switch prefs.serviceMode {
-				case .none: EmptyView()
-				case .userAgent: Text("· User service").foregroundColor(.secondary)
-				case .rootDaemon: Text("· Root service").foregroundColor(.secondary)
-			}
-			if !model.query.isEmpty {
-				Text("· Filtered").foregroundColor(.secondary)
-			}
-		}
-		.padding(.horizontal, 12)
-		.padding(.vertical, 4)
-		.font(.caption)
-		.foregroundColor(.secondary)
 	}
 
 	// ===========================
@@ -256,7 +282,7 @@ struct ContentView: View {
 		return vF
 	}()
 
-	private static func formatSize(inBytes: Int64) -> String {
+	fileprivate static func formatSize(inBytes: Int64) -> String {
 		return kSizeFormatter.string(fromByteCount: inBytes)
 	}
 
@@ -267,8 +293,50 @@ struct ContentView: View {
 		return vF
 	}()
 
-	private static func formatDate(inDate: Date) -> String {
+	fileprivate static func formatDate(inDate: Date) -> String {
 		if inDate.timeIntervalSince1970 < 1 { return "—" }
 		return kDateFormatter.string(from: inDate)
+	}
+}
+
+// ===========================
+// MARK: Status bar
+// ===========================
+
+// Extracted into its own View so its @Published-driven refreshes (cache
+// load progress, indexed count changes during a scan, service-mode flip)
+// only re-evaluate this small view rather than the ContentView body that
+// contains the Table. SwiftUI's dependency tracking is per-View, so an
+// isolated leaf observer doesn't churn the Table's closure scope.
+private struct StatusBarView: View {
+
+	@EnvironmentObject var model: AppModel
+	@EnvironmentObject var prefs: Preferences
+
+	var body: some View {
+		HStack(spacing: 8) {
+			if model.isIndexing {
+				ProgressView()
+					.controlSize(.small)
+				Text("Indexing…  \(model.indexedCount) entries")
+			} else {
+				Text("\(model.visibleRecords.count) shown  ·  \(model.indexedCount) indexed")
+			}
+			Spacer()
+			Text(model.isIndexer ? "Indexer" : "Reader")
+				.foregroundColor(.secondary)
+			switch prefs.serviceMode {
+				case .none: EmptyView()
+				case .userAgent: Text("· User service").foregroundColor(.secondary)
+				case .rootDaemon: Text("· Root service").foregroundColor(.secondary)
+			}
+			if !model.query.isEmpty {
+				Text("· Filtered").foregroundColor(.secondary)
+			}
+		}
+		.padding(.horizontal, 12)
+		.padding(.vertical, 4)
+		.font(.caption)
+		.foregroundColor(.secondary)
 	}
 }
