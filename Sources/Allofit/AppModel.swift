@@ -84,6 +84,13 @@ final class AppModel: ObservableObject {
 	private var cachePollTimer: Timer?
 	// last mtime we observed on the cache file - skips needless reloads
 	private var lastSeenCacheMtime: Date?
+	// minimum gap between two reader-mode reloads. Prevents the Table from
+	// being re-rendered while the user is mid-click. 1 second is well below
+	// any human-perceptible "stale" threshold but caps the worst-case churn
+	// during heavy filesystem activity.
+	private let kMinReloadInterval: TimeInterval = 1.0
+	// timestamp of the last reloadFromCache() that actually swapped data in
+	private var lastReloadAt: Date?
 
 	init() {
 		// only the cheap UI state is restored synchronously - the cache file
@@ -188,9 +195,13 @@ final class AppModel: ObservableObject {
 	}
 
 	// manually triggered cache reload; surfaced as a button in the Cache tab
-	// so users can verify the GUI reads what the daemon wrote
+	// so users can verify the GUI reads what the daemon wrote. Bypasses
+	// reloadFromCache's rate-limit / same-eventId guards since the user
+	// explicitly asked.
 	func forceReloadCache() {
 		NSLog("[Allofit GUI] manual reload triggered")
+		lastReloadAt = nil
+		lastEventId = 0
 		reloadFromCache()
 	}
 
@@ -509,11 +520,36 @@ final class AppModel: ObservableObject {
 		}
 	}
 
-	// reloads the on-disk cache off-main and swaps it in atomically
+	// reloads the on-disk cache off-main and swaps it in atomically.
+	//
+	// Two guards keep this from disrupting Table interactions:
+	//   1. lastEventId comparison - the daemon advances its event id every
+	//      time it actually persists new state, so a matching id means the
+	//      records on disk are identical to what we have and we can bail
+	//      before touching any @Published. This is what was eating clicks:
+	//      the daemon resaving an unchanged cache still bumped its mtime,
+	//      the poller triggered a reload, and the resulting @Published
+	//      cascade re-rendered the Table at the exact moment the user
+	//      was clicking a row.
+	//   2. A 1-second floor between reloads. Even when changes do happen,
+	//      we don't need to re-render the whole list at FSEvents' rate -
+	//      the next tick will catch any newer state.
 	private func reloadFromCache() {
+		let vNow = Date()
+		if let vLast = lastReloadAt, vNow.timeIntervalSince(vLast) < kMinReloadInterval {
+			return
+		}
+		lastReloadAt = vNow
 		let vUrl = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
+		let vCurrentEventId = lastEventId
 		ioQueue.async { [weak self] in
 			let vCache = IndexStore.load(from: vUrl)
+			// short-circuit when the on-disk content matches what we already
+			// have - common when the daemon resaves on a noise-only FSEvents
+			// burst (e.g. spotlight reindexing, temp files in /var)
+			if let vC = vCache, vC.lastEventId == vCurrentEventId {
+				return
+			}
 			let vLookup = AppModel.buildPathLookup(inRecords: vCache?.records ?? [])
 			DispatchQueue.main.async {
 				guard let vCache = vCache else { return }
