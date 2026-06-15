@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   release:
-    name: Build .app and publish release
+    name: Build .app + DMG and publish release
     runs-on: macos-15
 
     steps:
@@ -45,10 +45,19 @@ jobs:
         run: |
           ditto -c -k --keepParent --sequesterRsrc \
             Allofit.app \
-            "Allofit-${{ steps.version.outputs.tag }}.zip"
+            "Allofit-${{ steps.version.outputs.version }}.zip"
 
-      - name: SHA-256 checksum
-        run: shasum -a 256 "Allofit-${{ steps.version.outputs.tag }}.zip" | tee Allofit-${{ steps.version.outputs.tag }}.zip.sha256
+      - name: Build DMG (drag-to-install with /Applications shortcut)
+        env:
+          ALLOFIT_VERSION: ${{ steps.version.outputs.version }}
+        run: ./build-dmg.sh --skip-build
+
+      - name: SHA-256 checksums
+        run: |
+          shasum -a 256 \
+            "Allofit-${{ steps.version.outputs.version }}.zip" \
+            "Allofit-${{ steps.version.outputs.version }}.dmg" \
+            | tee "Allofit-${{ steps.version.outputs.version }}.sha256"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -58,5 +67,6 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            Allofit-${{ steps.version.outputs.tag }}.zip
-            Allofit-${{ steps.version.outputs.tag }}.zip.sha256
+            Allofit-${{ steps.version.outputs.version }}.zip
+            Allofit-${{ steps.version.outputs.version }}.dmg
+            Allofit-${{ steps.version.outputs.version }}.sha256

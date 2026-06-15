@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
 
+// Posted by AllofitApp's "Find" menu command (⌘F). SearchField's Coordinator
+// listens and re-grabs first responder, mimicking the standard Find shortcut.
+extension Notification.Name {
+	static let allofitFocusSearch = Notification.Name("AllofitFocusSearch")
+}
+
 // SearchField wraps AppKit's NSSearchField so we get native macOS behaviors
 // the SwiftUI TextField cannot offer: a built-in recent-searches dropdown
 // behind the magnifying glass, persistent history via recentsAutosaveName,
@@ -87,6 +93,27 @@ struct SearchField: NSViewRepresentable {
 
 		init(_ inParent: SearchField) {
 			parent = inParent
+			super.init()
+			// listen for the global ⌘F notification so menu Find re-focuses
+			// the search field even when it isn't first responder
+			NotificationCenter.default.addObserver(
+				self,
+				selector: #selector(handleFocusRequest),
+				name: .allofitFocusSearch,
+				object: nil
+			)
+		}
+
+		deinit {
+			NotificationCenter.default.removeObserver(self)
+		}
+
+		// fired by the Find menu item; brings the search field to first
+		// responder and selects existing text so typing replaces it
+		@objc private func handleFocusRequest() {
+			guard let vField = field else { return }
+			vField.window?.makeFirstResponder(vField)
+			vField.selectText(nil)
 		}
 
 		// fired on every keystroke; reset navigation and push text to SwiftUI

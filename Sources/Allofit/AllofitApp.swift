@@ -21,6 +21,10 @@ struct AllofitApp: App {
 		}
 		.windowToolbarStyle(.unified)
 		.commands {
+			// custom About panel with a clickable repo link in the credits
+			CommandGroup(replacing: .appInfo) {
+				Button("About Allofit") { showAboutPanel() }
+			}
 			CommandGroup(after: .appInfo) {
 				Button("Reindex All") {
 					Task { await model.performReindex() }
@@ -28,6 +32,15 @@ struct AllofitApp: App {
 				.keyboardShortcut("r", modifiers: [.command])
 			}
 			CommandGroup(replacing: .newItem) { }
+			// ⌘F focuses the search field. Standard Find-style shortcut.
+			// SearchField's Coordinator observes the notification and calls
+			// makeFirstResponder on its underlying NSSearchField.
+			CommandGroup(after: .pasteboard) {
+				Button("Find") {
+					NotificationCenter.default.post(name: .allofitFocusSearch, object: nil)
+				}
+				.keyboardShortcut("f", modifiers: [.command])
+			}
 		}
 		Settings {
 			SettingsView()
@@ -72,6 +85,24 @@ struct MainWindowMarker: NSViewRepresentable {
 			AppDelegate.mainWindow = vWindow
 		}
 	}
+}
+
+// Opens the standard macOS About panel with a clickable GitHub link in the
+// Credits section. App name + version come from Info.plist automatically.
+private func showAboutPanel() {
+	let vUrlString = "https://github.com/bitsycore/Allofit"
+	let vCredits = NSMutableAttributedString(
+		string: vUrlString,
+		attributes: [
+			.link: URL(string: vUrlString) as Any,
+			.font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+			.foregroundColor: NSColor.linkColor
+		]
+	)
+	NSApplication.shared.orderFrontStandardAboutPanel(options: [
+		.credits: vCredits
+	])
+	NSApp.activate(ignoringOtherApps: true)
 }
 
 // AppDelegate handles the activation lifecycle. It also keeps the app

@@ -26,21 +26,42 @@ Allofit keeps an in-memory index of every file's name + metadata on configured r
 - macOS 15 (Sequoia) or newer.
 - Swift 6 toolchain (Xcode 16 ships with Swift 6.0; the repo uses `swift-tools-version: 6.0` with `swiftLanguageMode(.v5)`).
 
-## Build & run
+## Install (from a release)
+
+Grab the latest from [Releases](https://github.com/bitsycore/Allofit/releases).
+
+- **`.dmg`** — double-click, drag `Allofit` onto the `Applications` shortcut, eject.
+- **`.zip`** — unzip, move `Allofit.app` to `/Applications` (or run from anywhere).
+- **`.sha256`** — checksums for both files if you want to verify the download.
+
+### Gatekeeper warning on first launch
+
+Allofit ships ad-hoc signed (no Developer ID) since it's an open-source utility. macOS Gatekeeper will refuse to launch it on first open with the "unidentified developer" message. Two ways past it:
+
+```bash
+# the well-mannered way: tell macOS you've reviewed the binary
+xattr -dr com.apple.quarantine /Applications/Allofit.app
+open /Applications/Allofit.app
+```
+
+Or right-click `Allofit.app` in Finder → **Open** → confirm the warning dialog. Once accepted, subsequent launches don't prompt.
+
+## Build from source
 
 ```bash
 # Local dev: produces an ad-hoc-signed Allofit.app next to the repo
 ./build-app.sh
 open Allofit.app
-```
 
-The `build-app.sh` script reads two env vars for versioning:
+# Package as a drag-to-install DMG
+./build-dmg.sh                 # rebuilds the .app first, then DMGs it
+./build-dmg.sh --skip-build    # assumes Allofit.app already exists
 
-```bash
+# Pin a version in the Info.plist (CI does this automatically from the tag)
 ALLOFIT_VERSION=1.2.3 ALLOFIT_BUILD=42 ./build-app.sh
 ```
 
-Defaults to `0.0.0` / `0` when unset.
+Both scripts default to `ALLOFIT_VERSION=0.0.0` / `ALLOFIT_BUILD=0` when the env vars are unset.
 
 For a one-shot run without building the bundle:
 
@@ -91,4 +112,18 @@ Important: macOS TCC restricts even root from receiving FSEvents for `~/Document
 
 ## CI / releases
 
-`.github/workflows/ci.yml` builds debug + release on every push/PR to `main`. `.github/workflows/release.yml` fires on tag pushes — builds the bundle, computes a SHA-256, and publishes a GitHub Release with the zip and checksum attached. Tag with `0.0.1` or `v0.0.1` (the leading `v` is stripped before being stamped into the Info.plist).
+`.github/workflows/ci.yml` builds debug + release on every push/PR to `main`. `.github/workflows/release.yml` fires on tag pushes — builds the bundle, packages a `.zip` and a `.dmg`, computes SHA-256 checksums for both, and publishes a GitHub Release with all artifacts attached. Tag with `0.0.1` or `v0.0.1` (the leading `v` is stripped before being stamped into the Info.plist).
+
+## Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| ⌘F | Focus the search field (and select existing text) |
+| ⌘R | Reindex everything |
+| ⌘, | Open Preferences |
+| ⌘W | Hide the window (process stays resident; ⌘Q to actually quit) |
+| ↑ / ↓ in the search field | Cycle through recent search history |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
