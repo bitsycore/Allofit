@@ -188,24 +188,20 @@ enum ServiceInstaller {
 		return (vProcess.terminationStatus, vOutStr, vErrStr)
 	}
 
-	// runs a shell script with administrator privileges through AppleScript;
-	// the system shows the standard password prompt the first time
+	// runs a shell script with administrator privileges. Bridges
+	// AdminShell.Error into ServiceInstaller.InstallError so the calling
+	// SettingsView UI gets a single error type to surface.
 	private static func runWithAdminPrivileges(inScript: String) throws {
-		let vEscaped = inScript
-			.replacingOccurrences(of: "\\", with: "\\\\")
-			.replacingOccurrences(of: "\"", with: "\\\"")
-		let vAppleScriptSource = "do shell script \"\(vEscaped)\" with administrator privileges"
-		let vScript = NSAppleScript(source: vAppleScriptSource)
-		var vErr: NSDictionary?
-		let vResult = vScript?.executeAndReturnError(&vErr)
-		if vResult == nil {
-			let vMessage = vErr?[NSAppleScript.errorMessage] as? String ?? "unknown AppleScript error"
-			throw InstallError.authorizationFailed(vMessage)
+		do {
+			_ = try AdminShell.run(inScript)
+		} catch let vErr as AdminShell.Error {
+			throw InstallError.authorizationFailed(vErr.errorDescription ?? "\(vErr)")
 		}
 	}
 
-	// minimal POSIX-style single-quote escape
+	// shell-quote helper, delegating to the shared AdminShell quoter so
+	// both call sites use the same escaping rules
 	private static func shellQuote(inString: String) -> String {
-		return "'" + inString.replacingOccurrences(of: "'", with: "'\\''") + "'"
+		return AdminShell.quote(inString)
 	}
 }

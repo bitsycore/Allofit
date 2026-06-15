@@ -10,16 +10,22 @@ struct AllofitApp: App {
 	@NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 	// shared application state injected into the view tree
 	@StateObject private var model = AppModel()
+	// session-scoped store of sudo-staged user-readable copies. Sits
+	// alongside AppModel so both the Table (lock badge on rows) and
+	// the PreviewPane observe the same authorization state.
+	@StateObject private var access = AccessManager()
 
 	var body: some Scene {
 		WindowGroup("Allofit") {
 			ContentView()
 				.environmentObject(model)
 				.environmentObject(Preferences.shared)
+				.environmentObject(access)
 				.frame(minWidth: 760, minHeight: 480)
 				.background(MainWindowMarker())
 		}
 		.windowToolbarStyle(.unified)
+		.defaultSize(width: 1100, height: 640)
 		.commands {
 			// custom About panel with a clickable repo link in the credits
 			CommandGroup(replacing: .appInfo) {
@@ -46,6 +52,7 @@ struct AllofitApp: App {
 			SettingsView()
 				.environmentObject(model)
 				.environmentObject(Preferences.shared)
+				.environmentObject(access)
 		}
 	}
 }
@@ -126,6 +133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// bundle - covers the SwiftPM "swift run" case
 		NSApp.setActivationPolicy(.regular)
 		NSApp.activate(ignoringOtherApps: true)
+		// wipe any elevated-access staging files left over from a previous
+		// run so a crash or hard-kill doesn't accumulate privileged copies
+		// in ~/Library/Caches across sessions
+		ElevatedAccess.cleanup()
 		// bring the main window to the front so it accepts keystrokes
 		DispatchQueue.main.async {
 			for vWindow in NSApp.windows where vWindow.canBecomeKey {
@@ -134,6 +145,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 				break
 			}
 		}
+	}
+
+	// called on clean Cmd+Q quit; wipes the elevated-access staging dir
+	// so the user-readable copies of privileged files don't linger
+	func applicationWillTerminate(_ notification: Notification) {
+		ElevatedAccess.cleanup()
 	}
 
 	// keep the process alive when the user closes the last window: the index

@@ -3,12 +3,13 @@ import AppKit
 
 // ContentView is the main window layout: a search bar bonded to the title
 // bar via `.background(.bar)` (Liquid Glass on macOS 26, vibrant material
-// on macOS 15), a results table that fills the body, and a status bar at
-// the bottom. The Settings gear sits permanently in the window toolbar.
+// on macOS 15), a results table on the left, a Quick Look preview pane on
+// the right (toggleable via the toolbar), and a status bar at the bottom.
 struct ContentView: View {
 
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var prefs: Preferences
+	@EnvironmentObject var access: AccessManager
 	@State private var selection: Set<FileRecord.ID> = []
 	// drives the Table's drag-to-reorder and column-visibility customization.
 	// Initial value is hydrated from UserDefaults so the user's column order
@@ -18,15 +19,16 @@ struct ContentView: View {
 	// Cancelled+rescheduled per change so a drag (which fires onChange on
 	// every micro-update) only runs JSONEncoder once, off-main.
 	@State private var columnSaveTask: Task<Void, Never>?
+	// whether the right-hand preview pane is currently visible. Persisted
+	// across launches so the user's pane-visibility preference sticks.
+	@AppStorage("Allofit.showPreviewPane") private var showPreviewPane: Bool = true
 
 	private nonisolated static let kColumnCustomizationKey = "Allofit.columnCustomization"
 	private nonisolated static let kColumnSaveDebounceNanos: UInt64 = 300_000_000
 
 	// Computed binding for the Table's sortOrder: reads/writes
 	// model.sortDescriptor directly so the sort state survives any number
-	// of window closes / reopens (the previous `@State sortOrder` got
-	// reset whenever the view was recreated, and the onChange-syncing
-	// dance occasionally didn't re-wire properly after a window reopen).
+	// of window closes / reopens.
 	private var sortOrderBinding: Binding<[KeyPathComparator<FileRecord>]> {
 		Binding(
 			get: { [Self.comparatorFor(inDescriptor: model.sortDescriptor)] },
@@ -44,14 +46,30 @@ struct ContentView: View {
 	}
 
 	var body: some View {
-		VStack(spacing: 0) {
-			searchBar
-			resultsTable
-			Divider()
-			StatusBarView()  // isolated so its @Published refresh
-							 // doesn't re-evaluate the Table closure
+		Group {
+			if showPreviewPane {
+				HSplitView {
+					mainColumn
+						.layoutPriority(1)
+						.frame(minWidth: 460)
+					PreviewPane(selection: selection)
+						.frame(minWidth: 200, idealWidth: 360)
+				}
+			} else {
+				mainColumn
+			}
 		}
 		.toolbar {
+			ToolbarItem(placement: .primaryAction) {
+				Button {
+					showPreviewPane.toggle()
+				} label: {
+					Image(systemName: showPreviewPane
+						  ? "sidebar.right"
+						  : "sidebar.squares.right")
+				}
+				.help(showPreviewPane ? "Hide preview" : "Show preview")
+			}
 			ToolbarItem(placement: .primaryAction) {
 				SettingsLink {
 					Image(systemName: "gearshape")
@@ -80,12 +98,21 @@ struct ContentView: View {
 		}
 	}
 
+	// search bar + table + status bar - everything except the preview pane
+	private var mainColumn: some View {
+		VStack(spacing: 0) {
+			searchBar
+			resultsTable
+			Divider()
+			StatusBarView()  // isolated so its @Published refresh
+							 // doesn't re-evaluate the Table closure
+		}
+	}
+
 	// ===========================
 	// MARK: Column customization persistence
 	// ===========================
 
-	// loads the previously-saved column order/visibility from UserDefaults,
-	// or returns a fresh default if nothing was saved or decoding fails
 	private static func loadColumnCustomization() -> TableColumnCustomization<FileRecord> {
 		guard let vData = UserDefaults.standard.data(forKey: kColumnCustomizationKey),
 			  let vCustom = try? JSONDecoder().decode(
@@ -98,10 +125,6 @@ struct ContentView: View {
 		return vCustom
 	}
 
-	// persists the current column order/visibility to UserDefaults.
-	// nonisolated so the debounced background task can call it without an
-	// actor hop - the encode is the only non-trivial step and we want it
-	// genuinely off-main during column drags.
 	private nonisolated static func saveColumnCustomization(_ inValue: TableColumnCustomization<FileRecord>) {
 		guard let vData = try? JSONEncoder().encode(inValue) else { return }
 		UserDefaults.standard.set(vData, forKey: kColumnCustomizationKey)
@@ -111,10 +134,6 @@ struct ContentView: View {
 	// MARK: Search bar
 	// ===========================
 
-	// Always-visible row at the top. `.background(.bar)` uses the system
-	// "bar" material, which sits right below the toolbar with the same
-	// vibrancy treatment - on macOS 26 this is the Liquid Glass surface,
-	// on macOS 15 it's the standard chrome material.
 	private var searchBar: some View {
 		SearchField(
 			text: $model.query,
@@ -132,16 +151,11 @@ struct ContentView: View {
 	// ===========================
 
 	private var resultsTable: some View {
-		// Uses the explicit `rows:` form of Table so we can attach `.draggable`
-		// to TableRow rather than to cell content. Putting `.draggable` on
-		// cell content installs a SwiftUI drag-gesture recognizer that
-		// competes with NSTableView's mouseDown → selection event on
-		// macOS 26 - the recognizer's "should this be a drag?" decision
-		// delays and occasionally eats the click, leaving the row never
-		// selected even though right-click (which bypasses the drag gesture
-		// entirely) still works. Row-level `.draggable` puts the drag at
-		// the same scope as NSTableView's own row-drag machinery and leaves
-		// the click path clean.
+		// Uses the explicit `rows:` form of Table so `.draggable` lives on
+		// TableRow rather than embedded in cell content. Cell-content
+		// draggable installs a SwiftUI drag-gesture recognizer that races
+		// with NSTableView's mouseDown→selection event on macOS 26 and
+		// occasionally eats left-clicks; row-level draggable doesn't.
 		Table(of: FileRecord.self,
 			  selection: $selection,
 			  sortOrder: sortOrderBinding,
@@ -156,6 +170,19 @@ struct ContentView: View {
 					.frame(width: 16, height: 16)
 					Text(vRecord.name)
 						.lineLimit(1)
+					// When the preview pane is closed, surface the
+					// elevate-permission affordance on the selected row
+					// itself so the user has a way to authorize without
+					// having to open the pane first. needsAuthorization
+					// is a stat() call so we only invoke it for the row
+					// that's actually selected.
+					if !showPreviewPane,
+					   selection.count == 1,
+					   selection.contains(vRecord.id),
+					   access.needsAuthorization(for: vRecord) {
+						Spacer(minLength: 4)
+						AuthorizeBadge(record: vRecord)
+					}
 				}
 			}
 			.width(min: 200, ideal: 320)
@@ -171,7 +198,7 @@ struct ContentView: View {
 			.customizationID("path")
 
 			TableColumn("Size", value: \FileRecord.size) { vRecord in
-				Text(vRecord.isDirectory ? "—" : Self.formatSize(inBytes: vRecord.size))
+				Text(vRecord.isDirectory ? "—" : Formatters.size(bytes: vRecord.size))
 					.foregroundColor(.secondary)
 					.monospacedDigit()
 			}
@@ -179,7 +206,7 @@ struct ContentView: View {
 			.customizationID("size")
 
 			TableColumn("Created", value: \FileRecord.dateCreated) { vRecord in
-				Text(Self.formatDate(inDate: vRecord.dateCreated))
+				Text(Formatters.date(vRecord.dateCreated))
 					.foregroundColor(.secondary)
 					.monospacedDigit()
 			}
@@ -187,7 +214,7 @@ struct ContentView: View {
 			.customizationID("created")
 
 			TableColumn("Modified", value: \FileRecord.dateModified) { vRecord in
-				Text(Self.formatDate(inDate: vRecord.dateModified))
+				Text(Formatters.date(vRecord.dateModified))
 					.foregroundColor(.secondary)
 					.monospacedDigit()
 			}
@@ -208,6 +235,16 @@ struct ContentView: View {
 		} primaryAction: { vIds in
 			openSelection(inIds: vIds)
 		}
+		// Finder-style spacebar Quick Look. .onKeyPress only fires when the
+		// view (Table) has keyboard focus, so spaces typed into the search
+		// field still produce literal spaces in the query.
+		.onKeyPress(.space) {
+			guard !selection.isEmpty else { return .ignored }
+			let vUrls = recordsFor(inIds: selection)
+				.map { URL(fileURLWithPath: $0.fullPath) }
+			QuickLookCoordinator.shared.show(inUrls: vUrls)
+			return .handled
+		}
 	}
 
 	// ===========================
@@ -215,24 +252,32 @@ struct ContentView: View {
 	// ===========================
 
 	private func revealSelection(inIds: Set<FileRecord.ID>) {
+		// reveal in Finder shows the *original* file (not the staged copy),
+		// since the user wants to navigate to the real location on disk
 		let vUrls = recordsFor(inIds: inIds).map { URL(fileURLWithPath: $0.fullPath) }
 		NSWorkspace.shared.activateFileViewerSelecting(vUrls)
 	}
 
 	private func quickLookSelection(inIds: Set<FileRecord.ID>) {
-		let vUrls = recordsFor(inIds: inIds).map { URL(fileURLWithPath: $0.fullPath) }
+		// prefer the staged URL when one exists - QLPreviewPanel renders
+		// it without permission issues, whereas the original would fail
+		let vUrls = recordsFor(inIds: inIds).map { access.effectiveURL(for: $0) }
 		QuickLookCoordinator.shared.show(inUrls: vUrls)
 	}
 
 	private func copyPaths(inIds: Set<FileRecord.ID>) {
+		// always copy the original path - the staged tmp path is an
+		// implementation detail that has no meaning outside this session
 		let vPaths = recordsFor(inIds: inIds).map { $0.fullPath }
 		NSPasteboard.general.clearContents()
 		NSPasteboard.general.setString(vPaths.joined(separator: "\n"), forType: .string)
 	}
 
 	private func openSelection(inIds: Set<FileRecord.ID>) {
+		// open the staged copy when available so the default app can read
+		// it; falls back to the original path for files we can read directly
 		for vRecord in recordsFor(inIds: inIds) {
-			NSWorkspace.shared.open(URL(fileURLWithPath: vRecord.fullPath))
+			NSWorkspace.shared.open(access.effectiveURL(for: vRecord))
 		}
 	}
 
@@ -244,7 +289,6 @@ struct ContentView: View {
 	// MARK: Sort mapping
 	// ===========================
 
-	// converts a Table sort comparator into the model's FileSortDescriptor
 	private static func mapSortOrder(inComparator: KeyPathComparator<FileRecord>) -> FileSortDescriptor {
 		let vAsc = inComparator.order == .forward
 		let vKp = inComparator.keyPath
@@ -256,7 +300,6 @@ struct ContentView: View {
 		return .nameAscending
 	}
 
-	// returns the matching comparator for a given persisted sort descriptor
 	private static func comparatorFor(inDescriptor: FileSortDescriptor) -> KeyPathComparator<FileRecord> {
 		switch inDescriptor {
 			case .nameAscending: return KeyPathComparator(\FileRecord.name, order: .forward)
@@ -271,32 +314,6 @@ struct ContentView: View {
 			case .modifiedDescending: return KeyPathComparator(\FileRecord.dateModified, order: .reverse)
 		}
 	}
-
-	// ===========================
-	// MARK: Formatting helpers
-	// ===========================
-
-	private static let kSizeFormatter: ByteCountFormatter = {
-		let vF = ByteCountFormatter()
-		vF.countStyle = .file
-		return vF
-	}()
-
-	fileprivate static func formatSize(inBytes: Int64) -> String {
-		return kSizeFormatter.string(fromByteCount: inBytes)
-	}
-
-	private static let kDateFormatter: DateFormatter = {
-		let vF = DateFormatter()
-		vF.dateStyle = .short
-		vF.timeStyle = .short
-		return vF
-	}()
-
-	fileprivate static func formatDate(inDate: Date) -> String {
-		if inDate.timeIntervalSince1970 < 1 { return "—" }
-		return kDateFormatter.string(from: inDate)
-	}
 }
 
 // ===========================
@@ -305,9 +322,8 @@ struct ContentView: View {
 
 // Extracted into its own View so its @Published-driven refreshes (cache
 // load progress, indexed count changes during a scan, service-mode flip)
-// only re-evaluate this small view rather than the ContentView body that
-// contains the Table. SwiftUI's dependency tracking is per-View, so an
-// isolated leaf observer doesn't churn the Table's closure scope.
+// only re-evaluate this small leaf view rather than the ContentView body
+// that contains the Table.
 private struct StatusBarView: View {
 
 	@EnvironmentObject var model: AppModel
