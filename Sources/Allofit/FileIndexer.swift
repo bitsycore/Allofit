@@ -49,21 +49,29 @@ enum FileIndexer {
 			vBatch.append(vRootRecord)
 		}
 
+		// Per-iteration autoreleasepool: every URL pulled from the
+		// enumerator + every resourceValues() read autoreleases an
+		// NSURL / NSDate / NSNumber. Without this drain a million-file
+		// walk would let those accumulate into hundreds of MB of dead
+		// allocations until the enclosing async block exited - and the
+		// daemon's enclosing block never exits.
 		for vCase in vEnumerator {
-			guard let vURL = vCase as? URL else { continue }
+			autoreleasepool {
+				guard let vURL = vCase as? URL else { return }
 
-			// short-circuit excluded entries (and don't descend into them)
-			if let vMatcher = inExclusions, vMatcher.isExcluded(inPath: vURL.path) {
-				let vIsDir = (try? vURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-				if vIsDir { vEnumerator.skipDescendants() }
-				continue
-			}
+				// short-circuit excluded entries (and don't descend into them)
+				if let vMatcher = inExclusions, vMatcher.isExcluded(inPath: vURL.path) {
+					let vIsDir = (try? vURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+					if vIsDir { vEnumerator.skipDescendants() }
+					return
+				}
 
-			if let vRecord = makeRecord(inURL: vURL) {
-				vBatch.append(vRecord)
-				if vBatch.count >= inBatchSize {
-					inBatch(vBatch)
-					vBatch.removeAll(keepingCapacity: true)
+				if let vRecord = makeRecord(inURL: vURL) {
+					vBatch.append(vRecord)
+					if vBatch.count >= inBatchSize {
+						inBatch(vBatch)
+						vBatch.removeAll(keepingCapacity: true)
+					}
 				}
 			}
 		}
@@ -99,8 +107,17 @@ enum FileIndexer {
 	// builds a FileRecord from a URL's pre-fetched resource values.
 	// Clears the URL's resource-value cache first so we always re-stat the
 	// file - a file modified between two FSEvents batches would otherwise
-	// silently return the cached pre-edit mtime.
+	// silently return the cached pre-edit mtime. The whole body is wrapped
+	// in autoreleasepool so the autoreleased NSDate / NSNumber / NSURL
+	// objects returned by resourceValues() are released at function exit
+	// rather than at the caller's pool drain.
 	static func makeRecord(inURL: URL) -> FileRecord? {
+		return autoreleasepool { () -> FileRecord? in
+			makeRecord_impl(inURL: inURL)
+		}
+	}
+
+	private static func makeRecord_impl(inURL: URL) -> FileRecord? {
 		var vUrl = inURL
 		vUrl.removeAllCachedResourceValues()
 		guard let vValues = try? vUrl.resourceValues(forKeys: Set(kPrefetchKeys)) else {

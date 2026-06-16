@@ -241,13 +241,18 @@ final class AppModel: ObservableObject {
 			var vAccumulated: [FileRecord] = []
 			vAccumulated.reserveCapacity(200_000)
 			for vRoot in vRoots {
-				let vBaseline = vAccumulated.count
-				let vList = FileIndexer.indexRoot(inRoot: vRoot, inExclusions: vMatcher) { vCount in
-					DispatchQueue.main.async {
-						self?.indexedCount = vBaseline + vCount
+				// per-root autoreleasepool so the file-enumeration's
+				// autoreleased NSURL/NSDate/NSNumber objects don't pile
+				// up across roots inside this long-running async block
+				autoreleasepool {
+					let vBaseline = vAccumulated.count
+					let vList = FileIndexer.indexRoot(inRoot: vRoot, inExclusions: vMatcher) { vCount in
+						DispatchQueue.main.async {
+							self?.indexedCount = vBaseline + vCount
+						}
 					}
+					vAccumulated.append(contentsOf: vList)
 				}
-				vAccumulated.append(contentsOf: vList)
 			}
 			let vFinal = vAccumulated
 			let vLookup = AppModel.buildPathLookup(inRecords: vFinal)
@@ -494,11 +499,16 @@ final class AppModel: ObservableObject {
 				return true
 			}
 			for vPath in inPaths {
-				let vList = FileIndexer.indexRoot(
-					inRoot: URL(fileURLWithPath: vPath),
-					inExclusions: inExclusions
-				)
-				vKept.append(contentsOf: vList)
+				// per-subtree autoreleasepool keeps the rescan's
+				// autoreleased URL/stat objects from accumulating across
+				// subtrees inside this long-running async block
+				autoreleasepool {
+					let vList = FileIndexer.indexRoot(
+						inRoot: URL(fileURLWithPath: vPath),
+						inExclusions: inExclusions
+					)
+					vKept.append(contentsOf: vList)
+				}
 			}
 			let vFinal = vKept
 			let vLookup = AppModel.buildPathLookup(inRecords: vFinal)

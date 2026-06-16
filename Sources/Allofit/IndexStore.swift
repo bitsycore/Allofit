@@ -91,8 +91,18 @@ enum IndexStore {
 		save(inRecords: inRecords, inLastEventId: inLastEventId, to: cacheURL)
 	}
 
-	// writes the records and event id atomically to a specific URL
+	// writes the records and event id atomically to a specific URL.
+	// Wrapped in autoreleasepool because every call autoreleases a number
+	// of Foundation objects (the compressed NSData, NSURLs created by
+	// FileManager.replaceItem, etc.) - if the caller is a long-running
+	// block whose own pool never drains, those would accumulate forever.
 	static func save(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
+		autoreleasepool {
+			save_impl(inRecords: inRecords, inLastEventId: inLastEventId, to: inUrl)
+		}
+	}
+
+	private static func save_impl(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
 		var vPayload = Data()
 		vPayload.reserveCapacity(16 + inRecords.count * 80)
 		writeU64(into: &vPayload, value: inLastEventId)
@@ -151,8 +161,16 @@ enum IndexStore {
 		return load(from: cacheURL)
 	}
 
-	// reads the persisted index back from a specific URL
+	// reads the persisted index back from a specific URL. Wrapped in
+	// autoreleasepool so the decompressed NSData and the per-record
+	// String allocations don't linger in the caller's pool.
 	static func load(from inUrl: URL) -> LoadResult? {
+		return autoreleasepool {
+			load_impl(from: inUrl)
+		}
+	}
+
+	private static func load_impl(from inUrl: URL) -> LoadResult? {
 		guard let vData = try? Data(contentsOf: inUrl) else { return nil }
 		var vOffset = 0
 		guard let vMagic = readU32(from: vData, offset: &vOffset), vMagic == kMagic else { return nil }

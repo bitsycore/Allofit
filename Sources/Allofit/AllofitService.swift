@@ -55,22 +55,33 @@ enum AllofitService {
 		// the autosave thread (every 3s) can write partial progress while we
 		// continue walking. Without this, large filesystems leave the cache
 		// empty for many minutes and the GUI shows nothing.
+		//
+		// Both the per-root and per-batch callback bodies run inside their
+		// own autoreleasepool so the autoreleased NSURL / NSDate / NSNumber
+		// from the file enumeration don't pile up until the entire scan
+		// finishes - on a million-file scan that "pile" was peaking at
+		// well over a gig of dead allocations before the main thread's
+		// runloop got a chance to drain.
 		let vStartId = UInt64(FSEventsGetCurrentEventId())
 		for vRoot in vRoots {
-			NSLog("[Allofit] scanning %@", vRoot.path)
-			FileIndexer.walkRoot(inRoot: vRoot, inExclusions: vMatcher) { vBatch in
-				vState.lock.lock()
-				for vRec in vBatch {
-					if vMatcher.isExcluded(inPath: vRec.fullPath) { continue }
-					if vState.pathIndex[vRec.fullPath] == nil {
-						vState.pathIndex[vRec.fullPath] = vState.records.count
-						vState.records.append(vRec)
+			autoreleasepool {
+				NSLog("[Allofit] scanning %@", vRoot.path)
+				FileIndexer.walkRoot(inRoot: vRoot, inExclusions: vMatcher) { vBatch in
+					autoreleasepool {
+						vState.lock.lock()
+						for vRec in vBatch {
+							if vMatcher.isExcluded(inPath: vRec.fullPath) { continue }
+							if vState.pathIndex[vRec.fullPath] == nil {
+								vState.pathIndex[vRec.fullPath] = vState.records.count
+								vState.records.append(vRec)
+							}
+						}
+						vState.dirty = true
+						vState.lock.unlock()
 					}
 				}
-				vState.dirty = true
-				vState.lock.unlock()
+				NSLog("[Allofit] scanned %@: %d total entries so far", vRoot.path, vState.records.count)
 			}
-			NSLog("[Allofit] scanned %@: %d total entries so far", vRoot.path, vState.records.count)
 		}
 		// force one save right after the scan finishes, so the GUI sees a
 		// stable count even if no FSEvents come in for a while afterwards
@@ -98,27 +109,35 @@ enum AllofitService {
 			// dominating CPU and turning into the daemon's memory churn
 			var vRemoved: Set<String> = []
 
+			// Per-change autoreleasepool: a large FSEvents batch (e.g.
+			// `rm -rf` of a deep tree) can deliver thousands of paths in
+			// one callback. Each path's NSURL + reachability check + the
+			// makeRecord internals autorelease - per-change drain keeps
+			// peak memory bounded by a single record's worth, not the
+			// whole batch.
 			for vChange in vChanges {
-				if vMatcher.isExcluded(inPath: vChange.path) { continue }
-				if vChange.mustScanSubDirs {
-					vRescanPrefixes.append(vChange.path)
-					continue
-				}
-				// skip paths we've already queued for removal in this batch
-				if vRemoved.contains(vChange.path) { continue }
-				let vUrl = URL(fileURLWithPath: vChange.path)
-				let vExists = (try? vUrl.checkResourceIsReachable()) ?? false
-				if vExists, let vRec = FileIndexer.makeRecord(inURL: vUrl) {
-					if let vIdx = vState.pathIndex[vRec.fullPath] {
-						vState.records[vIdx] = vRec
-						vUpdated += 1
-					} else {
-						vState.pathIndex[vRec.fullPath] = vState.records.count
-						vState.records.append(vRec)
-						vAdded += 1
+				autoreleasepool {
+					if vMatcher.isExcluded(inPath: vChange.path) { return }
+					if vChange.mustScanSubDirs {
+						vRescanPrefixes.append(vChange.path)
+						return
 					}
-				} else if vState.pathIndex[vChange.path] != nil {
-					vRemoved.insert(vChange.path)
+					// skip paths we've already queued for removal in this batch
+					if vRemoved.contains(vChange.path) { return }
+					let vUrl = URL(fileURLWithPath: vChange.path)
+					let vExists = (try? vUrl.checkResourceIsReachable()) ?? false
+					if vExists, let vRec = FileIndexer.makeRecord(inURL: vUrl) {
+						if let vIdx = vState.pathIndex[vRec.fullPath] {
+							vState.records[vIdx] = vRec
+							vUpdated += 1
+						} else {
+							vState.pathIndex[vRec.fullPath] = vState.records.count
+							vState.records.append(vRec)
+							vAdded += 1
+						}
+					} else if vState.pathIndex[vChange.path] != nil {
+						vRemoved.insert(vChange.path)
+					}
 				}
 			}
 
@@ -162,27 +181,36 @@ enum AllofitService {
 		// Array/Dict capacity (which only grows on churn, never auto-shrinks)
 		// doesn't drift into multi-GB territory after a day of heavy file
 		// activity. RSS is logged each save so the trajectory is visible.
+		//
+		// CRITICAL: each iteration runs inside its own autoreleasepool. The
+		// outer GCD block has an autorelease pool that drains when the block
+		// returns - which for our `while true` never happens. Without an
+		// inner pool, every save's autoreleased NSData (returned by
+		// .compressed(using: .lz4) and friends) accumulates forever and the
+		// daemon's RSS grows by tens of MB per save (500MB+/min in practice).
 		DispatchQueue.global(qos: .utility).async {
 			let kCompactEvery = 20
 			var vSavesSinceCompact = 0
 			while true {
 				sleep(3)
-				vState.lock.lock()
-				let vShouldSave = vState.dirty
-				let vSnapshot = vState.records
-				vState.dirty = false
-				vState.lock.unlock()
-				if !vShouldSave { continue }
-				NSLog("[Allofit] autosaving %d records (RSS %.1f MB)",
-					  vSnapshot.count, processFootprintMB())
-				IndexStore.save(
-					inRecords: vSnapshot,
-					inLastEventId: vWatcher.latestEventId
-				)
-				vSavesSinceCompact += 1
-				if vSavesSinceCompact >= kCompactEvery {
-					vSavesSinceCompact = 0
-					compactContainers(vState)
+				autoreleasepool {
+					vState.lock.lock()
+					let vShouldSave = vState.dirty
+					let vSnapshot = vState.records
+					vState.dirty = false
+					vState.lock.unlock()
+					if !vShouldSave { return }
+					NSLog("[Allofit] autosaving %d records (RSS %.1f MB)",
+						  vSnapshot.count, processFootprintMB())
+					IndexStore.save(
+						inRecords: vSnapshot,
+						inLastEventId: vWatcher.latestEventId
+					)
+					vSavesSinceCompact += 1
+					if vSavesSinceCompact >= kCompactEvery {
+						vSavesSinceCompact = 0
+						compactContainers(vState)
+					}
 				}
 			}
 		}
