@@ -32,13 +32,36 @@ enum ServiceInstaller {
 		}
 	}
 
-	// installs (or replaces) the launchd plist for the given scope
+	// installs (or replaces) the launchd plist for the given scope. Also
+	// copies the binary to a renamed location ("Allofit Service") so the
+	// daemon process shows up distinctly from the GUI in Activity Monitor /
+	// `ps` - both used to be called "Allofit" because they share a binary.
 	static func install(inScope: Scope) throws {
 		let vBinary = try resolveBinaryPath()
-		let vPlistData = try makePlistData(inBinary: vBinary, inScope: inScope)
+		let vDaemonBinary = daemonBinaryPath(inScope: inScope)
+		let vVersionFile = vDaemonBinary + ".version"
+		let vVersionString = bundleVersion()
+		let vPlistData = try makePlistData(inBinary: vDaemonBinary, inScope: inScope)
 
 		switch inScope {
 			case .userAgent:
+				// user agent install: filesystem ops as the current user,
+				// no sudo needed for either the binary copy or the plist
+				let vDaemonDir = (vDaemonBinary as NSString).deletingLastPathComponent
+				try? FileManager.default.createDirectory(
+					atPath: vDaemonDir,
+					withIntermediateDirectories: true
+				)
+				try? FileManager.default.removeItem(atPath: vDaemonBinary)
+				try FileManager.default.copyItem(atPath: vBinary, toPath: vDaemonBinary)
+				// sidecar .version file - lets the GUI show which build is
+				// installed without having to run the copied binary
+				try? vVersionString.write(
+					toFile: vVersionFile,
+					atomically: true,
+					encoding: .utf8
+				)
+
 				let vTarget = userAgentPath()
 				try? FileManager.default.createDirectory(
 					at: vTarget.deletingLastPathComponent(),
@@ -52,12 +75,23 @@ enum ServiceInstaller {
 				}
 
 			case .rootDaemon:
+				// root daemon install: binary copy + plist install + boot
+				// happen inside a single admin-priv script so the user
+				// gets ONE password prompt covering all of it
 				let vTmp = FileManager.default.temporaryDirectory
 					.appendingPathComponent("\(kLabel).plist")
 				try vPlistData.write(to: vTmp, options: .atomic)
 				let vTarget = rootDaemonPath()
+				let vDaemonDir = (vDaemonBinary as NSString).deletingLastPathComponent
 				let vScript = """
-				cp \(shellQuote(inString: vTmp.path)) \(shellQuote(inString: vTarget.path)) \
+				mkdir -p \(shellQuote(inString: vDaemonDir)) \
+				&& rm -f \(shellQuote(inString: vDaemonBinary)) \
+				&& cp \(shellQuote(inString: vBinary)) \(shellQuote(inString: vDaemonBinary)) \
+				&& chown root:wheel \(shellQuote(inString: vDaemonBinary)) \
+				&& chmod 755 \(shellQuote(inString: vDaemonBinary)) \
+				&& printf '%s' \(shellQuote(inString: vVersionString)) > \(shellQuote(inString: vVersionFile)) \
+				&& chmod 644 \(shellQuote(inString: vVersionFile)) \
+				&& cp \(shellQuote(inString: vTmp.path)) \(shellQuote(inString: vTarget.path)) \
 				&& chown root:wheel \(shellQuote(inString: vTarget.path)) \
 				&& chmod 644 \(shellQuote(inString: vTarget.path)) \
 				; /bin/launchctl bootout system \(shellQuote(inString: vTarget.path)) 2>/dev/null \
@@ -67,17 +101,25 @@ enum ServiceInstaller {
 		}
 	}
 
-	// removes the launchd plist for the given scope
+	// removes the launchd plist AND the renamed binary copy AND the
+	// sidecar .version file for the given scope
 	static func uninstall(inScope: Scope) throws {
+		let vDaemonBinary = daemonBinaryPath(inScope: inScope)
+		let vVersionFile = vDaemonBinary + ".version"
 		switch inScope {
 			case .userAgent:
 				let vTarget = userAgentPath()
 				_ = runLaunchctl(inArgs: ["unload", vTarget.path])
 				try? FileManager.default.removeItem(at: vTarget)
+				try? FileManager.default.removeItem(atPath: vDaemonBinary)
+				try? FileManager.default.removeItem(atPath: vVersionFile)
 
 			case .rootDaemon:
 				let vTarget = rootDaemonPath()
-				let vScript = "/bin/launchctl bootout system \(shellQuote(inString: vTarget.path)) 2>/dev/null ; rm -f \(shellQuote(inString: vTarget.path))"
+				let vScript = """
+				/bin/launchctl bootout system \(shellQuote(inString: vTarget.path)) 2>/dev/null \
+				; rm -f \(shellQuote(inString: vTarget.path)) \(shellQuote(inString: vDaemonBinary)) \(shellQuote(inString: vVersionFile))
+				"""
 				try runWithAdminPrivileges(inScript: vScript)
 		}
 	}
@@ -88,6 +130,74 @@ enum ServiceInstaller {
 			case .userAgent: return FileManager.default.fileExists(atPath: userAgentPath().path)
 			case .rootDaemon: return FileManager.default.fileExists(atPath: rootDaemonPath().path)
 		}
+	}
+
+	// stops the running daemon for the given scope without uninstalling.
+	// The plist file stays on disk so a later start() (or app relaunch
+	// since RunAtLoad=true) brings it back. Use cases: temporary disable,
+	// freeing FSEvents resources, or pre-flight before a manual reindex.
+	static func stop(inScope: Scope) throws {
+		switch inScope {
+			case .userAgent:
+				let vPlist = userAgentPath().path
+				let vResult = runLaunchctl(inArgs: ["unload", vPlist])
+				if vResult.exitCode != 0 {
+					throw InstallError.launchctlFailed(vResult.stderr.isEmpty ? "exit \(vResult.exitCode)" : vResult.stderr)
+				}
+			case .rootDaemon:
+				let vPlist = rootDaemonPath().path
+				let vScript = "/bin/launchctl bootout system \(shellQuote(inString: vPlist))"
+				try runWithAdminPrivileges(inScript: vScript)
+		}
+	}
+
+	// starts a previously-installed but currently-stopped daemon.
+	static func start(inScope: Scope) throws {
+		switch inScope {
+			case .userAgent:
+				let vPlist = userAgentPath().path
+				let vResult = runLaunchctl(inArgs: ["load", "-w", vPlist])
+				if vResult.exitCode != 0 {
+					throw InstallError.launchctlFailed(vResult.stderr.isEmpty ? "exit \(vResult.exitCode)" : vResult.stderr)
+				}
+			case .rootDaemon:
+				let vPlist = rootDaemonPath().path
+				let vScript = "/bin/launchctl bootstrap system \(shellQuote(inString: vPlist))"
+				try runWithAdminPrivileges(inScript: vScript)
+		}
+	}
+
+	// true if the daemon process for the given scope is currently alive.
+	// We check by reading the indexer lock file's PID and probing with
+	// kill(pid, 0) - cheaper and non-privileged compared to launchctl.
+	static func isRunning(inScope: Scope) -> Bool {
+		let vSystem = (inScope == .rootDaemon)
+		let vLockPath = IndexStore.lockURL(forSystem: vSystem).path
+		guard let vPid = IndexerLock.readHolderPid(path: vLockPath) else { return false }
+		// signal 0 = check-only; EPERM means "process exists but we lack
+		// permission to signal it", which is still "alive"
+		let vRc = kill(vPid, 0)
+		if vRc == 0 { return true }
+		if vRc == -1 && errno == EPERM { return true }
+		return false
+	}
+
+	// returns the version stamped into the installed daemon binary's
+	// sidecar .version file (written at install time). nil if the
+	// service isn't installed or the sidecar is missing/corrupt.
+	static func installedVersion(inScope: Scope) -> String? {
+		let vPath = daemonBinaryPath(inScope: inScope) + ".version"
+		guard let vText = try? String(contentsOfFile: vPath, encoding: .utf8) else {
+			return nil
+		}
+		let vTrimmed = vText.trimmingCharacters(in: .whitespacesAndNewlines)
+		return vTrimmed.isEmpty ? nil : vTrimmed
+	}
+
+	// returns the version of the running .app bundle (what would be
+	// installed if the user clicks Install right now)
+	static func bundleVersion() -> String {
+		return (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
 	}
 
 	// stops the service, removes the cache file, and starts the service again
@@ -123,6 +233,21 @@ enum ServiceInstaller {
 
 	private static func rootDaemonPath() -> URL {
 		return URL(fileURLWithPath: "/Library/LaunchDaemons/\(kLabel).plist")
+	}
+
+	// Filesystem path where the daemon's binary is installed. We use a
+	// renamed copy ("Allofit Service") so the daemon process is named
+	// differently from the GUI in Activity Monitor / ps - both used to
+	// be just "Allofit" because they shared the same on-disk binary.
+	// The filename embedded in argv[0] is what those tools display.
+	static func daemonBinaryPath(inScope: Scope) -> String {
+		switch inScope {
+			case .userAgent:
+				return NSHomeDirectory()
+					+ "/Library/Application Support/Allofit/Allofit Service"
+			case .rootDaemon:
+				return "/Library/Application Support/Allofit/Allofit Service"
+		}
 	}
 
 	// resolves an absolute path to the currently running binary

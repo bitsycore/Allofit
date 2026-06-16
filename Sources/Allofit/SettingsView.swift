@@ -213,12 +213,26 @@ private struct VolumesTab: View {
 // MARK: Service tab
 // ===========================
 
-// ServiceTab manages installation of the LaunchAgent or LaunchDaemon that
-// keeps the index up to date while the GUI is closed.
+// ServiceTab manages the LaunchAgent / LaunchDaemon that keeps the index
+// up to date while the GUI is closed. Surfaces install/uninstall, run-
+// state (stop/start), and the gap between the version that's currently
+// installed on disk vs the bundle the user is running right now.
 private struct ServiceTab: View {
 
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var model: AppModel
+	// tick value to force the status block to recompute on a timer; the
+	// status doesn't observe @Published changes since it reads file
+	// system state directly, so we need an explicit refresh signal
+	@State private var statusTick: Int = 0
+
+	private var scope: ServiceInstaller.Scope? {
+		switch prefs.serviceMode {
+			case .none: return nil
+			case .userAgent: return .userAgent
+			case .rootDaemon: return .rootDaemon
+		}
+	}
 
 	var body: some View {
 		VStack(alignment: .leading, spacing: 12) {
@@ -249,20 +263,15 @@ private struct ServiceTab: View {
 				}
 			}
 
-			HStack {
-				Button("Install") {
-					Task { await model.performInstallService() }
-				}
-				.disabled(prefs.serviceMode == .none || model.isWorking)
-				Button("Uninstall") {
-					Task { await model.performUninstallService() }
-				}
-				.disabled(prefs.serviceMode == .none || model.isWorking)
-				Spacer()
-				if model.isWorking {
-					ProgressView().controlSize(.small)
-				}
-				if !model.workMessage.isEmpty {
+			installDescription
+
+			actionButtons
+
+			if !model.workMessage.isEmpty {
+				HStack(spacing: 6) {
+					if model.isWorking {
+						ProgressView().controlSize(.small)
+					}
 					Text(model.workMessage)
 						.font(.caption)
 						.foregroundColor(.secondary)
@@ -271,16 +280,141 @@ private struct ServiceTab: View {
 
 			Divider()
 
-			Text(currentStatusText())
-				.font(.caption)
-				.foregroundColor(.secondary)
+			statusBlock
+		}
+		.onAppear { statusTick &+= 1 }
+		.onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+			statusTick &+= 1
+		}
+		.onChange(of: model.isWorking) { _, _ in statusTick &+= 1 }
+	}
+
+	// ===========================
+	// MARK: Install explanation
+	// ===========================
+
+	@ViewBuilder
+	private var installDescription: some View {
+		if let vScope = scope {
+			GroupBox {
+				VStack(alignment: .leading, spacing: 4) {
+					Text("Install will:")
+						.font(.caption.bold())
+					Text("• Copy the running binary to \(daemonBinaryPath(for: vScope)) so the daemon has a stable on-disk path that won't break if you move Allofit.app.")
+						.font(.caption)
+					Text("• Write the launchd plist that runs it as \(vScope == .rootDaemon ? "root" : "your user").")
+						.font(.caption)
+					Text("• Start the daemon via launchctl bootstrap.")
+						.font(.caption)
+					if vScope == .rootDaemon {
+						Text("• Prompt once for your administrator password (steps run as one privileged script).")
+							.font(.caption)
+					}
+					Text("Reinstall any time you rebuild Allofit.app - the on-disk copy doesn't auto-update.")
+						.font(.caption)
+						.foregroundColor(.secondary)
+						.padding(.top, 2)
+				}
+				.frame(maxWidth: .infinity, alignment: .leading)
+			}
 		}
 	}
 
-	private func currentStatusText() -> String {
-		let vUser = ServiceInstaller.isInstalled(inScope: .userAgent) ? "installed" : "not installed"
-		let vRoot = ServiceInstaller.isInstalled(inScope: .rootDaemon) ? "installed" : "not installed"
-		return "User agent: \(vUser)   ·   Root daemon: \(vRoot)"
+	// ===========================
+	// MARK: Action buttons
+	// ===========================
+
+	private var actionButtons: some View {
+		let vInstalled = scope.map { ServiceInstaller.isInstalled(inScope: $0) } ?? false
+		let vRunning = scope.map { ServiceInstaller.isRunning(inScope: $0) } ?? false
+		_ = statusTick  // re-read the file-system status on each tick
+		return HStack {
+			Button("Install") {
+				Task { await model.performInstallService() }
+			}
+			.disabled(prefs.serviceMode == .none || model.isWorking)
+			Button("Uninstall") {
+				Task { await model.performUninstallService() }
+			}
+			.disabled(prefs.serviceMode == .none || !vInstalled || model.isWorking)
+			Button("Stop") {
+				Task { await model.performStopService() }
+			}
+			.disabled(!vInstalled || !vRunning || model.isWorking)
+			Button("Start") {
+				Task { await model.performStartService() }
+			}
+			.disabled(!vInstalled || vRunning || model.isWorking)
+			Spacer()
+		}
+	}
+
+	// ===========================
+	// MARK: Status block
+	// ===========================
+
+	private var statusBlock: some View {
+		_ = statusTick  // ensure recomputation each tick
+		let vScope = scope
+		let vInstalled = vScope.map { ServiceInstaller.isInstalled(inScope: $0) } ?? false
+		let vRunning = vScope.map { ServiceInstaller.isRunning(inScope: $0) } ?? false
+		let vInstalledVer = vScope.flatMap { ServiceInstaller.installedVersion(inScope: $0) }
+		let vBundleVer = ServiceInstaller.bundleVersion()
+		let vStale = vInstalled && vInstalledVer != nil && vInstalledVer != vBundleVer
+
+		return VStack(alignment: .leading, spacing: 4) {
+			LabeledContent("Service installed") {
+				Text(vInstalled ? "yes" : "no")
+					.foregroundColor(vInstalled ? .primary : .secondary)
+					.font(.callout)
+			}
+			LabeledContent("Currently running") {
+				Text(vRunning ? "yes" : "no")
+					.foregroundColor(vRunning ? .green : .secondary)
+					.font(.callout)
+			}
+			LabeledContent("Installed version") {
+				Text(vInstalledVer ?? "—")
+					.font(.callout)
+					.monospacedDigit()
+			}
+			LabeledContent("This app's version") {
+				HStack(spacing: 6) {
+					Text(vBundleVer)
+						.font(.callout)
+						.monospacedDigit()
+					if vStale {
+						Text("Reinstall to update")
+							.font(.caption)
+							.foregroundColor(.orange)
+					}
+				}
+			}
+			if let vScope = vScope {
+				LabeledContent("Other scope") {
+					Text(otherScopeStatusText(currentScope: vScope))
+						.font(.caption)
+						.foregroundColor(.secondary)
+				}
+			}
+		}
+	}
+
+	// path of the daemon-renamed binary copy, used in the explanatory blurb
+	private func daemonBinaryPath(for inScope: ServiceInstaller.Scope) -> String {
+		return ServiceInstaller.daemonBinaryPath(inScope: inScope)
+	}
+
+	// summary of the *other* scope's install state so the user can see at
+	// a glance that they don't have a stray install on the unused side
+	private func otherScopeStatusText(currentScope inCurrent: ServiceInstaller.Scope) -> String {
+		let vOther: ServiceInstaller.Scope = (inCurrent == .userAgent) ? .rootDaemon : .userAgent
+		let vLabel = (vOther == .userAgent) ? "User agent" : "Root daemon"
+		let vInstalled = ServiceInstaller.isInstalled(inScope: vOther)
+		let vRunning = vInstalled && ServiceInstaller.isRunning(inScope: vOther)
+		if vRunning { return "\(vLabel): running" }
+		if vInstalled { return "\(vLabel): installed (stopped)" }
+		return "\(vLabel): not installed"
 	}
 }
 

@@ -104,7 +104,11 @@ if [[ -f "$kSystemDaemonPlist" ]]; then
 fi
 
 echo "==> Killing any leftover daemon processes"
-vRun pkill -f "Allofit --service" >/dev/null 2>&1 || true
+# `pkill -f` matches against the full command line; the daemon binary is
+# now installed as ".../Allofit Service" (renamed copy), so the literal
+# "Allofit --service" no longer appears - use a regex that handles both
+# the legacy and the renamed binary by anchoring on "Allofit...--service"
+vRun pkill -f "Allofit.*--service" >/dev/null 2>&1 || true
 
 # ==================
 # MARK: Cache files

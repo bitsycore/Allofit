@@ -309,6 +309,28 @@ final class AppModel: ObservableObject {
 		}
 	}
 
+	// stops the running daemon for the current serviceMode preference
+	// without uninstalling. Plist stays on disk so the next launch (or
+	// performStartService) brings it back.
+	func performStopService() async {
+		await runPrivilegedAction(inLabel: "Stopping service") { vScope, _ in
+			try ServiceInstaller.stop(inScope: vScope)
+		}
+	}
+
+	// starts a stopped-but-installed daemon for the current serviceMode
+	// preference. Hot-swaps the GUI into reader mode on success so the
+	// reader watcher picks up the daemon's first cache write.
+	func performStartService() async {
+		let vOk = await runPrivilegedAction(inLabel: "Starting service") { vScope, _ in
+			try ServiceInstaller.start(inScope: vScope)
+		}
+		if vOk {
+			try? await Task.sleep(nanoseconds: 1_500_000_000)
+			switchToCurrentMode()
+		}
+	}
+
 	// uninstalls the launchd service for the current serviceMode preference.
 	// On success the GUI hot-swaps back into built-in indexer mode.
 	func performUninstallService() async {

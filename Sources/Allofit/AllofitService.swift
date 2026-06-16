@@ -1,5 +1,6 @@
 import Foundation
 import CoreServices
+import Darwin
 
 // AllofitService is the headless runtime invoked by launchd when the binary
 // is launched with the --service argument. It builds an initial index, then
@@ -91,7 +92,11 @@ enum AllofitService {
 			var vRescanPrefixes: [String] = []
 			var vAdded = 0
 			var vUpdated = 0
-			var vRemovedCount = 0
+			// batch removals into a set so we do one bulk allRecords pass
+			// and rebuild pathIndex once per FSEvents batch, instead of
+			// O(records) per individual removal - that nested rebuild was
+			// dominating CPU and turning into the daemon's memory churn
+			var vRemoved: Set<String> = []
 
 			for vChange in vChanges {
 				if vMatcher.isExcluded(inPath: vChange.path) { continue }
@@ -99,6 +104,8 @@ enum AllofitService {
 					vRescanPrefixes.append(vChange.path)
 					continue
 				}
+				// skip paths we've already queued for removal in this batch
+				if vRemoved.contains(vChange.path) { continue }
 				let vUrl = URL(fileURLWithPath: vChange.path)
 				let vExists = (try? vUrl.checkResourceIsReachable()) ?? false
 				if vExists, let vRec = FileIndexer.makeRecord(inURL: vUrl) {
@@ -110,18 +117,20 @@ enum AllofitService {
 						vState.records.append(vRec)
 						vAdded += 1
 					}
-				} else if let vIdx = vState.pathIndex[vChange.path] {
-					vState.records.remove(at: vIdx)
-					vState.pathIndex.removeAll(keepingCapacity: true)
-					for (vI, vR) in vState.records.enumerated() {
-						vState.pathIndex[vR.fullPath] = vI
-					}
-					vRemovedCount += 1
+				} else if vState.pathIndex[vChange.path] != nil {
+					vRemoved.insert(vChange.path)
 				}
 			}
-			if vAdded + vUpdated + vRemovedCount > 0 {
+
+			if !vRemoved.isEmpty {
+				// single bulk removeAll + single pathIndex rebuild
+				vState.records.removeAll { vRemoved.contains($0.fullPath) }
+				rebuildPathIndex(vState)
+			}
+
+			if vAdded + vUpdated + vRemoved.count > 0 {
 				NSLog("[Allofit] applied: +%d / ~%d / -%d (total %d)",
-					  vAdded, vUpdated, vRemovedCount, vState.records.count)
+					  vAdded, vUpdated, vRemoved.count, vState.records.count)
 			}
 
 			if !vRescanPrefixes.isEmpty {
@@ -141,10 +150,7 @@ enum AllofitService {
 					)
 					vState.records.append(contentsOf: vList)
 				}
-				vState.pathIndex.removeAll(keepingCapacity: true)
-				for (vI, vR) in vState.records.enumerated() {
-					vState.pathIndex[vR.fullPath] = vI
-				}
+				rebuildPathIndex(vState)
 			}
 
 			vState.dirty = true
@@ -152,7 +158,13 @@ enum AllofitService {
 
 		// periodic save loop (background thread). 3-second check interval so
 		// new files appear in the GUI within a few seconds of being created.
+		// Every N saves we also compact the in-memory containers so Swift's
+		// Array/Dict capacity (which only grows on churn, never auto-shrinks)
+		// doesn't drift into multi-GB territory after a day of heavy file
+		// activity. RSS is logged each save so the trajectory is visible.
 		DispatchQueue.global(qos: .utility).async {
+			let kCompactEvery = 20
+			var vSavesSinceCompact = 0
 			while true {
 				sleep(3)
 				vState.lock.lock()
@@ -160,12 +172,17 @@ enum AllofitService {
 				let vSnapshot = vState.records
 				vState.dirty = false
 				vState.lock.unlock()
-				if vShouldSave {
-					NSLog("[Allofit] autosaving %d records", vSnapshot.count)
-					IndexStore.save(
-						inRecords: vSnapshot,
-						inLastEventId: vWatcher.latestEventId
-					)
+				if !vShouldSave { continue }
+				NSLog("[Allofit] autosaving %d records (RSS %.1f MB)",
+					  vSnapshot.count, processFootprintMB())
+				IndexStore.save(
+					inRecords: vSnapshot,
+					inLastEventId: vWatcher.latestEventId
+				)
+				vSavesSinceCompact += 1
+				if vSavesSinceCompact >= kCompactEvery {
+					vSavesSinceCompact = 0
+					compactContainers(vState)
 				}
 			}
 		}
@@ -173,5 +190,62 @@ enum AllofitService {
 		// block forever on the runloop so launchd keeps us alive
 		RunLoop.current.run()
 		exit(0)
+	}
+
+	// rebuilds pathIndex from records. Used after a bulk allRecords mutation
+	// (batched removal or subtree rescan) - much cheaper than incrementally
+	// maintaining pathIndex during the mutation, and the reserveCapacity
+	// lets the dict size to its target without re-bucketing on each insert.
+	private static func rebuildPathIndex(_ inState: State) {
+		var vIndex: [String: Int] = [:]
+		vIndex.reserveCapacity(inState.records.count)
+		for (vI, vR) in inState.records.enumerated() {
+			vIndex[vR.fullPath] = vI
+		}
+		inState.pathIndex = vIndex
+	}
+
+	// recreates records and pathIndex with capacities matched to their
+	// actual element count. Swift Array/Dict only grow their backing
+	// allocations under churn, never auto-shrink, so a daemon that's
+	// been processing FSEvents for days can hold huge dead capacity
+	// (records.capacity >> records.count) that shows up as multi-GB
+	// RSS. Forcing fresh containers reclaims it.
+	private static func compactContainers(_ inState: State) {
+		inState.lock.lock()
+		defer { inState.lock.unlock() }
+		let vBefore = processFootprintMB()
+		// Array(_:) creates a fresh array sized exactly to the source -
+		// the old buffer's slack capacity is released
+		let vCompactRecords = Array(inState.records)
+		var vCompactIndex: [String: Int] = [:]
+		vCompactIndex.reserveCapacity(vCompactRecords.count)
+		for (vI, vR) in vCompactRecords.enumerated() {
+			vCompactIndex[vR.fullPath] = vI
+		}
+		inState.records = vCompactRecords
+		inState.pathIndex = vCompactIndex
+		let vAfter = processFootprintMB()
+		NSLog("[Allofit] compacted (%d records, RSS %.1f → %.1f MB)",
+			  vCompactRecords.count, vBefore, vAfter)
+	}
+
+	// resident-memory size in MB matching Activity Monitor's "Memory" column
+	// on modern macOS (Catalina+). phys_footprint is the kernel's accounting
+	// of pages owned by the task minus shared/clean pages.
+	private static func processFootprintMB() -> Double {
+		var vInfo = task_vm_info_data_t()
+		var vCount = mach_msg_type_number_t(
+			MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+		)
+		let vResult = withUnsafeMutablePointer(to: &vInfo) { vPtr in
+			vPtr.withMemoryRebound(to: integer_t.self, capacity: Int(vCount)) { vIntPtr in
+				task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), vIntPtr, &vCount)
+			}
+		}
+		if vResult == KERN_SUCCESS {
+			return Double(vInfo.phys_footprint) / (1024.0 * 1024.0)
+		}
+		return -1
 	}
 }
