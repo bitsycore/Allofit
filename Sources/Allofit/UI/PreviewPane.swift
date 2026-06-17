@@ -29,14 +29,20 @@ struct QuickLookPreviewView: NSViewRepresentable {
 	}
 }
 
-// AuthorizeBadge is the small lock icon that appears either inside the
-// preview pane (when the selected file isn't user-readable) or at the
-// right of the selected row when the preview pane is closed. Clicking
-// it kicks off the sudo cp + chown via AdminShell - the system prompts
-// for the password the first time inside the admin-auth-cache window.
+// AuthorizeBadge is the small lock icon that appears at the right of the
+// selected row when the preview pane is closed. Clicking it kicks off the
+// sudo cp + chown via AdminShell - the system prompts for the password
+// the first time inside the admin-auth-cache window.
+//
+// access is taken as an @ObservedObject property (not @EnvironmentObject)
+// because this view is hosted inside a SwiftUI Table cell, and Table cell
+// content is rendered in its own NSHostingView. That hosting view does
+// not reliably inherit the parent's environment objects; a missing
+// access lookup triggers EnvironmentObject.error() → SIGTRAP. Passing
+// the AccessManager explicitly sidesteps that entire failure mode.
 struct AuthorizeBadge: View {
 
-	@EnvironmentObject var access: AccessManager
+	@ObservedObject var access: AccessManager
 	let record: FileRecord
 
 	var body: some View {
@@ -71,13 +77,14 @@ struct PreviewPane: View {
 
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var access: AccessManager
+	@EnvironmentObject var searchModel: WindowSearchModel
 	// passed in from ContentView (its @State) so this view re-renders
 	// whenever the user's selection changes
 	let selection: Set<FileRecord.ID>
 
 	private var selectedRecord: FileRecord? {
 		guard selection.count == 1, let vId = selection.first else { return nil }
-		return model.visibleRecords.first(where: { $0.id == vId })
+		return searchModel.visibleRecords.first(where: { $0.id == vId })
 	}
 
 	var body: some View {

@@ -17,12 +17,7 @@ struct AllofitApp: App {
 
 	var body: some Scene {
 		WindowGroup("Allofit") {
-			ContentView()
-				.environmentObject(model)
-				.environmentObject(Preferences.shared)
-				.environmentObject(access)
-				.frame(minWidth: 760, minHeight: 480)
-				.background(MainWindowMarker())
+			AllofitWindowContent(model: model, access: access)
 		}
 		.windowToolbarStyle(.unified)
 		.defaultSize(width: 1100, height: 640)
@@ -37,7 +32,11 @@ struct AllofitApp: App {
 				}
 				.keyboardShortcut("r", modifiers: [.command])
 			}
-			CommandGroup(replacing: .newItem) { }
+			// SwiftUI provides File > New Window (⌘N) automatically for a
+			// WindowGroup; nothing to add here. Additional windows share the
+			// AppModel/AccessManager StateObjects defined above, so the index
+			// (and current search/sort) stays in sync across them - only the
+			// per-window selection / column-customization differ.
 			// ⌘F focuses the search field. Standard Find-style shortcut.
 			// SearchField's Coordinator observes the notification and calls
 			// makeFirstResponder on its underlying NSSearchField.
@@ -54,6 +53,39 @@ struct AllofitApp: App {
 				.environmentObject(Preferences.shared)
 				.environmentObject(access)
 		}
+	}
+}
+
+// AllofitWindowContent is the per-window root: it creates a fresh
+// WindowSearchModel for each window so the query / visible slice are
+// independent, while the shared AppModel + AccessManager + Preferences
+// are injected from the App level.
+//
+// The model/access StateObjects must be passed in via init so the
+// @StateObject autoclosure for WindowSearchModel can capture the shared
+// AppModel instance - @EnvironmentObject isn't available at init time.
+struct AllofitWindowContent: View {
+
+	let model: AppModel
+	let access: AccessManager
+	@StateObject private var searchModel: WindowSearchModel
+
+	init(model inModel: AppModel, access inAccess: AccessManager) {
+		self.model = inModel
+		self.access = inAccess
+		// @autoclosure: SwiftUI evaluates this exactly once when the view
+		// first appears, so re-renders won't keep allocating new search models
+		_searchModel = StateObject(wrappedValue: WindowSearchModel(model: inModel))
+	}
+
+	var body: some View {
+		ContentView()
+			.environmentObject(model)
+			.environmentObject(Preferences.shared)
+			.environmentObject(access)
+			.environmentObject(searchModel)
+			.frame(minWidth: 760, minHeight: 480)
+			.background(MainWindowMarker())
 	}
 }
 
@@ -133,6 +165,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// bundle - covers the SwiftPM "swift run" case
 		NSApp.setActivationPolicy(.regular)
 		NSApp.activate(ignoringOtherApps: true)
+		// shrink the AppKit help-tag (.help() / NSView.toolTip) hover delay.
+		// The system default is ~2 s; that makes truncated Name/Path cells
+		// feel unreadable. Registered as a default so a user-set value in
+		// the global domain still wins. Seconds.
+		UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0.3])
 		// wipe any elevated-access staging files left over from a previous
 		// run so a crash or hard-kill doesn't accumulate privileged copies
 		// in ~/Library/Caches across sessions
@@ -158,6 +195,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// Cmd+Q still quits via the standard Quit menu item.
 	func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
 		return false
+	}
+
+	// dock-icon right-click contextual menu: surface a "New Window" entry so
+	// the user can spawn an additional window without bringing the app to the
+	// front first. The action defers to whatever the File > New Window menu
+	// item does (SwiftUI auto-generates that item for WindowGroup) so we stay
+	// compatible with whichever underlying selector SwiftUI uses.
+	func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+		let vMenu = NSMenu()
+		let vItem = NSMenuItem(title: "New Window",
+								action: #selector(newWindowFromDock(_:)),
+								keyEquivalent: "")
+		vItem.target = self
+		vMenu.addItem(vItem)
+		return vMenu
+	}
+
+	// finds the ⌘N main-menu item (File > New Window) and re-invokes its
+	// action. We match on the keyboard shortcut rather than the title so the
+	// lookup survives localized menus.
+	@objc func newWindowFromDock(_ sender: Any?) {
+		guard let vMain = NSApp.mainMenu else { return }
+		for vTop in vMain.items {
+			guard let vSub = vTop.submenu else { continue }
+			for vItem in vSub.items {
+				if vItem.keyEquivalent == "n",
+				   vItem.keyEquivalentModifierMask == [.command],
+				   let vAction = vItem.action {
+					NSApp.sendAction(vAction, to: vItem.target, from: nil)
+					return
+				}
+			}
+		}
 	}
 
 	// dock-icon click while no windows are visible: re-show only the main

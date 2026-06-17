@@ -10,6 +10,9 @@ struct ContentView: View {
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var access: AccessManager
+	// per-window search model: owns this window's query + filtered slice so
+	// two windows can run independent searches against the shared AppModel
+	@EnvironmentObject var searchModel: WindowSearchModel
 	@State private var selection: Set<FileRecord.ID> = []
 	// drives the Table's drag-to-reorder and column-visibility customization.
 	// Initial value is hydrated from UserDefaults so the user's column order
@@ -26,12 +29,13 @@ struct ContentView: View {
 	private nonisolated static let kColumnCustomizationKey = "Allofit.columnCustomization"
 	private nonisolated static let kColumnSaveDebounceNanos: UInt64 = 300_000_000
 
-	// Computed binding for the Table's sortOrder: reads/writes
-	// model.sortDescriptor directly so the sort state survives any number
-	// of window closes / reopens.
+	// Computed binding for the Table's sortOrder: reads/writes the
+	// per-window searchModel.sortDescriptor so clicking a column header
+	// only re-sorts this window. The last-clicked sort is mirrored into
+	// Preferences so a fresh window opens with the most recent choice.
 	private var sortOrderBinding: Binding<[KeyPathComparator<FileRecord>]> {
 		Binding(
-			get: { [Self.comparatorFor(inDescriptor: model.sortDescriptor)] },
+			get: { [Self.comparatorFor(inDescriptor: searchModel.sortDescriptor)] },
 			set: { vNewOrder in
 				guard let vFirst = vNewOrder.first else { return }
 				let vDescriptor = Self.mapSortOrder(inComparator: vFirst)
@@ -39,7 +43,7 @@ struct ContentView: View {
 				// model while NSTableView is still in its sort delegate
 				// callback (avoids the reentrant-operation AppKit warning)
 				DispatchQueue.main.async {
-					model.sortDescriptor = vDescriptor
+					searchModel.sortDescriptor = vDescriptor
 				}
 			}
 		)
@@ -136,7 +140,7 @@ struct ContentView: View {
 
 	private var searchBar: some View {
 		SearchField(
-			text: $model.query,
+			text: $searchModel.query,
 			placeholder: "Search files…  e.g.  Start*.pdf  ·  *.png | *.jpg",
 			initiallyFirstResponder: true
 		)
@@ -170,6 +174,7 @@ struct ContentView: View {
 					.frame(width: 16, height: 16)
 					Text(vRecord.name)
 						.lineLimit(1)
+						.help(vRecord.name)
 					// When the preview pane is closed, surface the
 					// elevate-permission affordance on the selected row
 					// itself so the user has a way to authorize without
@@ -181,7 +186,11 @@ struct ContentView: View {
 					   selection.contains(vRecord.id),
 					   access.needsAuthorization(for: vRecord) {
 						Spacer(minLength: 4)
-						AuthorizeBadge(record: vRecord)
+						// pass access explicitly: Table cells live in
+						// detached NSHostingViews that don't reliably
+						// inherit @EnvironmentObject, which was the cause
+						// of repeated EnvironmentObject.error() crashes
+						AuthorizeBadge(access: access, record: vRecord)
 					}
 				}
 			}
@@ -193,6 +202,7 @@ struct ContentView: View {
 					.foregroundColor(.secondary)
 					.truncationMode(.middle)
 					.lineLimit(1)
+					.help(vRecord.parentPath)
 			}
 			.width(min: 200, ideal: 380)
 			.customizationID("path")
@@ -221,7 +231,7 @@ struct ContentView: View {
 			.width(140)
 			.customizationID("modified")
 		} rows: {
-			ForEach(model.visibleRecords) { vRecord in
+			ForEach(searchModel.visibleRecords) { vRecord in
 				TableRow(vRecord)
 					.draggable(URL(fileURLWithPath: vRecord.fullPath))
 			}
@@ -282,7 +292,7 @@ struct ContentView: View {
 	}
 
 	private func recordsFor(inIds: Set<FileRecord.ID>) -> [FileRecord] {
-		return model.visibleRecords.filter { inIds.contains($0.id) }
+		return searchModel.visibleRecords.filter { inIds.contains($0.id) }
 	}
 
 	// ===========================
@@ -328,6 +338,7 @@ private struct StatusBarView: View {
 
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var prefs: Preferences
+	@EnvironmentObject var searchModel: WindowSearchModel
 
 	var body: some View {
 		HStack(spacing: 8) {
@@ -336,7 +347,7 @@ private struct StatusBarView: View {
 					.controlSize(.small)
 				Text("Indexing…  \(model.indexedCount) entries")
 			} else {
-				Text("\(model.visibleRecords.count) shown  ·  \(model.indexedCount) indexed")
+				Text("\(searchModel.visibleRecords.count) shown  ·  \(model.indexedCount) indexed")
 			}
 			Spacer()
 			Text(model.isIndexer ? "Indexer" : "Reader")
@@ -346,7 +357,7 @@ private struct StatusBarView: View {
 				case .userAgent: Text("· User service").foregroundColor(.secondary)
 				case .rootDaemon: Text("· Root service").foregroundColor(.secondary)
 			}
-			if !model.query.isEmpty {
+			if !searchModel.query.isEmpty {
 				Text("· Filtered").foregroundColor(.secondary)
 			}
 		}

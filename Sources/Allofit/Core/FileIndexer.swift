@@ -107,17 +107,12 @@ enum FileIndexer {
 	// builds a FileRecord from a URL's pre-fetched resource values.
 	// Clears the URL's resource-value cache first so we always re-stat the
 	// file - a file modified between two FSEvents batches would otherwise
-	// silently return the cached pre-edit mtime. The whole body is wrapped
-	// in autoreleasepool so the autoreleased NSDate / NSNumber / NSURL
-	// objects returned by resourceValues() are released at function exit
-	// rather than at the caller's pool drain.
+	// silently return the cached pre-edit mtime. Callers (walkRoot's
+	// enumerator loop, applyFileSystemChanges, AllofitService) already
+	// wrap each invocation in an autoreleasepool, so the autoreleased
+	// NSDate / NSNumber / NSURL objects from resourceValues() drain at
+	// the caller's pool boundary.
 	static func makeRecord(inURL: URL) -> FileRecord? {
-		return autoreleasepool { () -> FileRecord? in
-			makeRecord_impl(inURL: inURL)
-		}
-	}
-
-	private static func makeRecord_impl(inURL: URL) -> FileRecord? {
 		var vUrl = inURL
 		vUrl.removeAllCachedResourceValues()
 		guard let vValues = try? vUrl.resourceValues(forKeys: Set(kPrefetchKeys)) else {

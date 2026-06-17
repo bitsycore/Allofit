@@ -90,6 +90,12 @@ struct SearchField: NSViewRepresentable {
 		private var navigationIndex: Int?
 		// text the user typed before starting to navigate; restored on rollback
 		private var savedQuery: String = ""
+		// debounced auto-save to recents: if the user stops typing for this
+		// many nanoseconds, the current query is added to recents as though
+		// they had pressed Return
+		private static let kAutoSaveDelayNanos: UInt64 = 4_000_000_000
+		// pending auto-save task; cancelled+rescheduled on every keystroke
+		private var autoSaveTask: Task<Void, Never>?
 
 		init(_ inParent: SearchField) {
 			parent = inParent
@@ -109,9 +115,12 @@ struct SearchField: NSViewRepresentable {
 		}
 
 		// fired by the Find menu item; brings the search field to first
-		// responder and selects existing text so typing replaces it
+		// responder and selects existing text so typing replaces it.
+		// With multi-window, every Coordinator gets the notification - so
+		// we only act when our field belongs to the currently key window;
+		// otherwise inactive windows would all race to steal focus.
 		@objc private func handleFocusRequest() {
-			guard let vField = field else { return }
+			guard let vField = field, vField.window?.isKeyWindow == true else { return }
 			vField.window?.makeFirstResponder(vField)
 			vField.selectText(nil)
 		}
@@ -126,6 +135,28 @@ struct SearchField: NSViewRepresentable {
 				// Table while AppKit is still in the NSSearchField delegate
 				DispatchQueue.main.async { [weak self] in
 					self?.parent.text = vValue
+				}
+			}
+			scheduleAutoSave(field: vField)
+		}
+
+		// reschedules the deferred "treat the current query as submitted"
+		// task. Called on every keystroke; if the user stops typing for the
+		// configured dwell time, the query lands in recents without Enter.
+		private func scheduleAutoSave(field inField: NSSearchField) {
+			autoSaveTask?.cancel()
+			let vQuery = inField.stringValue.trimmingCharacters(in: .whitespaces)
+			guard !vQuery.isEmpty else { return }
+			autoSaveTask = Task { [weak self, weak inField] in
+				try? await Task.sleep(nanoseconds: Coordinator.kAutoSaveDelayNanos)
+				if Task.isCancelled { return }
+				await MainActor.run {
+					guard let vField = inField else { return }
+					// the user may have edited or cleared the field while we
+					// slept; only commit if the snapshot still matches
+					let vNow = vField.stringValue.trimmingCharacters(in: .whitespaces)
+					guard vNow == vQuery else { return }
+					self?.addCurrentToRecents(field: vField)
 				}
 			}
 		}

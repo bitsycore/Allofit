@@ -23,10 +23,11 @@ private final class BackgroundMtime: @unchecked Sendable {
 	}
 }
 
-// AppModel is the central observable state for the application.
+// AppModel is the shared backing state for the application.
 // It owns the in-memory file index, drives the background indexer and the
-// FSEvents watcher, debounces the search query and exposes a filtered/sorted
-// slice of the index to SwiftUI.
+// FSEvents watcher, and exposes the active sort descriptor. The per-window
+// search query and filtered/visible slice live in WindowSearchModel so two
+// windows can run independent searches against this same shared index.
 //
 // Threading rule of thumb: this class is @MainActor so all Published properties
 // are written from main. Heavy work (LZ4 (de)compression, filtering, sorting,
@@ -39,8 +40,6 @@ final class AppModel: ObservableObject {
 
 	// the canonical full index of every entry observed so far
 	@Published private(set) var allRecords: [FileRecord] = []
-	// the filtered, sorted and capped records currently shown in the table
-	@Published private(set) var visibleRecords: [FileRecord] = []
 	// total number of entries indexed (used for the status bar)
 	@Published private(set) var indexedCount: Int = 0
 	// true while a full reindex is in progress
@@ -49,37 +48,14 @@ final class AppModel: ObservableObject {
 	@Published private(set) var isLoadingCache: Bool = false
 	// true when this process owns the index (got the lock or built-in mode)
 	@Published private(set) var isIndexer: Bool = false
-	// the user-entered search query, debounced before filtering
-	@Published var query: String = "" {
-		didSet {
-			scheduleSearch()
-			prefs.lastQuery = query
-		}
-	}
-	// the active sort descriptor chosen by the user via column headers
-	@Published var sortDescriptor: FileSortDescriptor = .nameAscending {
-		didSet {
-			applyFilterAndSort()
-			prefs.lastSort = sortDescriptor
-		}
-	}
 
-	// maximum number of rows handed to SwiftUI Table for snappy scrolling
-	private let kMaxVisibleRows = 5000
-	// debounce delay between keystroke and filter rebuild
-	private let kSearchDebounceSeconds = 0.05
 	// how often the index is written to disk while running (seconds)
 	private let kAutosaveSeconds: TimeInterval = 30
 
 	private let prefs = Preferences.shared
 	// background queues isolated by concern - keeps the slow stuff off main
 	private let indexQueue = DispatchQueue(label: "allofit.index", qos: .utility)
-	private let searchQueue = DispatchQueue(label: "allofit.search", qos: .userInitiated)
 	private let ioQueue = DispatchQueue(label: "allofit.io", qos: .utility)
-	// pending debounced search work, cancelled on each keystroke
-	private var searchWorkItem: DispatchWorkItem?
-	// pending filter+sort task, cancelled if a newer one supersedes it
-	private var filterTask: Task<Void, Never>?
 	// watcher used in indexer mode for live updates
 	private let watcher = FileWatcher()
 	// watcher used in reader mode to detect cache file refreshes
@@ -106,8 +82,6 @@ final class AppModel: ObservableObject {
 	// runloop) so the periodic stat() doesn't compete with NSTableView click
 	// handling - main-runloop timers were the source of dropped clicks.
 	private var cachePollSource: DispatchSourceTimer?
-	// last mtime we observed on the cache file - skips needless reloads
-	private var lastSeenCacheMtime: Date?
 	// minimum gap between two reader-mode reloads. Prevents the Table from
 	// being re-rendered while the user is mid-click. 1 second is well below
 	// any human-perceptible "stale" threshold but caps the worst-case churn
@@ -117,10 +91,8 @@ final class AppModel: ObservableObject {
 	private var lastReloadAt: Date?
 
 	init() {
-		// only the cheap UI state is restored synchronously - the cache file
-		// is loaded off-main in start() so the window appears instantly
-		query = prefs.lastQuery
-		sortDescriptor = prefs.lastSort
+		// no synchronous UI-state restoration needed; the cache file is
+		// loaded off-main in start() so the window appears instantly
 	}
 
 	// kicks off background activity for the first time. Subsequent calls are
@@ -152,8 +124,6 @@ final class AppModel: ObservableObject {
 		cachePollSource = nil
 		indexerLock?.unlock()
 		indexerLock = nil
-		filterTask?.cancel()
-		filterTask = nil
 	}
 
 	// determines indexer vs reader role, loads the cache from the appropriate
@@ -199,16 +169,9 @@ final class AppModel: ObservableObject {
 					vSelf.pathIndex = [:]
 					vSelf.indexedCount = 0
 				}
-				// capture the initial mtime so the reader-mode poller doesn't
-				// immediately re-trigger on its first tick
-				if let vAttrs = try? FileManager.default.attributesOfItem(atPath: vCacheURL.path),
-				   let vMtime = vAttrs[.modificationDate] as? Date {
-					vSelf.lastSeenCacheMtime = vMtime
-				} else {
-					vSelf.lastSeenCacheMtime = nil
-				}
 				vSelf.isLoadingCache = false
-				vSelf.applyFilterAndSort()
+				// WindowSearchModel(s) observe allRecords and will refilter;
+				// no need to kick a filter here ourselves
 				if vSelf.isIndexer {
 					vSelf.startIndexerMode()
 				} else {
@@ -481,7 +444,8 @@ final class AppModel: ObservableObject {
 			indexedCount = allRecords.count
 			lastEventId = watcher.latestEventId
 			dirty = true
-			scheduleSearch()
+			// WindowSearchModel(s) observe @Published allRecords and refilter
+			// on debounce; no need to fire a manual filter pass here
 		}
 	}
 
@@ -517,7 +481,6 @@ final class AppModel: ObservableObject {
 				self?.pathIndex = vLookup
 				self?.indexedCount = vFinal.count
 				self?.dirty = true
-				self?.scheduleSearch()
 			}
 		}
 	}
@@ -575,19 +538,6 @@ final class AppModel: ObservableObject {
 		cachePollSource = vSource
 	}
 
-	// stat()'s the cache file and triggers a reload when mtime changes
-	private func pollCacheForChanges() {
-		let vUrl = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
-		guard let vAttrs = try? FileManager.default.attributesOfItem(atPath: vUrl.path),
-			  let vMtime = vAttrs[.modificationDate] as? Date
-		else { return }
-		if lastSeenCacheMtime != vMtime {
-			NSLog("[Allofit GUI] cache mtime changed (poll), reloading")
-			lastSeenCacheMtime = vMtime
-			reloadFromCache()
-		}
-	}
-
 	// reloads the on-disk cache off-main and swaps it in atomically.
 	//
 	// Two guards keep this from disrupting Table interactions:
@@ -625,7 +575,6 @@ final class AppModel: ObservableObject {
 				self?.pathIndex = vLookup
 				self?.indexedCount = vCache.records.count
 				self?.lastEventId = vCache.lastEventId
-				self?.applyFilterAndSort()
 			}
 		}
 	}
@@ -634,7 +583,9 @@ final class AppModel: ObservableObject {
 	// MARK: Internals
 	// ===========================
 
-	// installs a freshly-built index and refreshes the visible slice
+	// installs a freshly-built index and starts watching for changes. The
+	// per-window WindowSearchModel(s) observe allRecords and will refilter
+	// themselves; no need to fire a filter pass from here.
 	private func applyFreshIndex(inRecords: [FileRecord],
 								  inLookup: [String: Int],
 								  inEventId: UInt64) {
@@ -644,65 +595,8 @@ final class AppModel: ObservableObject {
 		lastEventId = inEventId
 		isIndexing = false
 		dirty = false
-		applyFilterAndSort()
 		if isIndexer {
 			startWatching(inSinceWhen: inEventId)
-		}
-	}
-
-	// debounces filter rebuilds so we don't refilter on every keystroke
-	private func scheduleSearch() {
-		searchWorkItem?.cancel()
-		let vItem = DispatchWorkItem { [weak self] in
-			DispatchQueue.main.async {
-				self?.applyFilterAndSort()
-			}
-		}
-		searchWorkItem = vItem
-		searchQueue.asyncAfter(deadline: .now() + kSearchDebounceSeconds, execute: vItem)
-	}
-
-	// runs the actual filter and sort on a detached task so the UI never
-	// stalls on keystrokes. The previous task is cancelled to avoid races.
-	private func applyFilterAndSort() {
-		filterTask?.cancel()
-		// snapshot inputs on main; the detached task is self-contained
-		let vQuery = query
-		let vSort = sortDescriptor
-		let vRecords = allRecords
-		let vMax = kMaxVisibleRows
-		filterTask = Task.detached(priority: .userInitiated) { [weak self] in
-			let vEngine = SearchEngine(inQuery: vQuery)
-			var vFiltered: [FileRecord]
-			if vEngine.isActive {
-				vFiltered = vRecords.filter { vEngine.match(inRecord: $0) }
-			} else {
-				vFiltered = vRecords
-			}
-			if Task.isCancelled { return }
-			AppModel.sortInPlace(inRecords: &vFiltered, inDescriptor: vSort)
-			if Task.isCancelled { return }
-			let vCapped: [FileRecord]
-			if vFiltered.count > vMax {
-				vCapped = Array(vFiltered.prefix(vMax))
-			} else {
-				vCapped = vFiltered
-			}
-			if Task.isCancelled { return }
-			// hop back to main with DispatchQueue.main.async (rather than
-			// await MainActor.run) so the assignment is guaranteed to land
-			// on the next runloop tick, avoiding NSTableView reentrance when
-			// the search field is mid-edit
-			DispatchQueue.main.async {
-				guard let vSelf = self else { return }
-				// Skip the @Published fire when the resulting list is byte-
-				// for-byte identical to what the Table is already showing.
-				// Full FileRecord equality catches mtime / size updates, so
-				// we only skip true no-op reassignments. Clicks landing on
-				// the Table during a no-op reload no longer get dropped.
-				if vSelf.visibleRecords == vCapped { return }
-				vSelf.visibleRecords = vCapped
-			}
 		}
 	}
 
@@ -718,9 +612,9 @@ final class AppModel: ObservableObject {
 	}
 
 	// sorts the provided slice in place. nonisolated so the detached filter
-	// task can call it without an actor hop.
-	private nonisolated static func sortInPlace(inRecords: inout [FileRecord],
-												 inDescriptor: FileSortDescriptor) {
+	// task can call it without an actor hop. Called by WindowSearchModel.
+	nonisolated static func sortInPlace(inRecords: inout [FileRecord],
+										 inDescriptor: FileSortDescriptor) {
 		switch inDescriptor {
 			case .nameAscending:
 				inRecords.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
