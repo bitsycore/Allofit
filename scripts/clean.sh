@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Removes every trace of Allofit from the system: launchd services, cache
 # files, user preferences, build artifacts and log files. Useful for a
-# clean reinstall test or to fully uninstall.
+# clean reinstall test or to fully uninstall. Can be called from anywhere -
+# paths are resolved relative to the script's own location.
 #
 # Usage:
-#     ./clean.sh                  # clean everything
-#     ./clean.sh --keep-build     # leave .build/ and Allofit.app/ in place
-#     ./clean.sh --keep-prefs     # leave UserDefaults / preferences alone
-#     ./clean.sh --dry-run        # print what would happen, change nothing
+#     ./scripts/clean.sh                  # from project root
+#     scripts/clean.sh --keep-build       # leave .build/ and outputs/ in place
+#     ./clean.sh --keep-prefs             # from scripts/, keep user prefs
+#     ./clean.sh --dry-run                # print what would happen, change nothing
 set -uo pipefail
 
 # ==================
@@ -29,7 +30,9 @@ kServiceLogStderr="/tmp/allofit-service.err"
 # MARK: Args
 # ==================
 
-vScriptDir="$(cd "$(dirname "$0")" && pwd)"
+# Resolve the project root from the script's own location (scripts/..),
+# so this script works regardless of the caller's CWD.
+vProjectRoot="$(cd "$(dirname "$0")/.." && pwd)"
 vKeepBuild=0
 vKeepPrefs=0
 vDryRun=0
@@ -105,7 +108,7 @@ fi
 
 echo "==> Killing any leftover daemon processes"
 # `pkill -f` matches against the full command line; the daemon binary is
-# now installed as ".../Allofit Service" (renamed copy), so the literal
+# now installed as ".../Allofit service" (renamed copy), so the literal
 # "Allofit --service" no longer appears - use a regex that handles both
 # the legacy and the renamed binary by anchoring on "Allofit...--service"
 vRun pkill -f "Allofit.*--service" >/dev/null 2>&1 || true
@@ -172,13 +175,13 @@ fi
 # ==================
 
 if [[ "$vKeepBuild" -eq 0 ]]; then
-	if [[ -d "${vScriptDir}/.build" ]]; then
+	if [[ -d "${vProjectRoot}/.build" ]]; then
 		echo "==> Removing SwiftPM .build directory"
-		vRun rm -rf "${vScriptDir}/.build"
+		vRun rm -rf "${vProjectRoot}/.build"
 	fi
-	if [[ -d "${vScriptDir}/Allofit.app" ]]; then
-		echo "==> Removing Allofit.app bundle"
-		vRun rm -rf "${vScriptDir}/Allofit.app"
+	if [[ -d "${vProjectRoot}/outputs" ]]; then
+		echo "==> Removing outputs/ directory (built .app and .dmg)"
+		vRun rm -rf "${vProjectRoot}/outputs"
 	fi
 fi
 

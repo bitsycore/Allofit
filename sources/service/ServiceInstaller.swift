@@ -18,7 +18,7 @@ enum ServiceInstaller {
 		case rootDaemon
 	}
 
-	// errors surfaced to the UI
+	// errors surfaced to the ui
 	enum InstallError: Error, LocalizedError {
 		case binaryNotFound
 		case authorizationFailed(String)
@@ -33,7 +33,7 @@ enum ServiceInstaller {
 	}
 
 	// installs (or replaces) the launchd plist for the given scope. Also
-	// copies the binary to a renamed location ("Allofit Service") so the
+	// copies the binary to a renamed location ("Allofit service") so the
 	// daemon process shows up distinctly from the GUI in Activity Monitor /
 	// `ps` - both used to be called "Allofit" because they share a binary.
 	static func install(inScope: Scope) throws {
@@ -236,7 +236,7 @@ enum ServiceInstaller {
 	}
 
 	// Filesystem path where the daemon's binary is installed. We use a
-	// renamed copy ("Allofit Service") so the daemon process is named
+	// renamed copy ("Allofit service") so the daemon process is named
 	// differently from the GUI in Activity Monitor / ps - both used to
 	// be just "Allofit" because they shared the same on-disk binary.
 	// The filename embedded in argv[0] is what those tools display.
@@ -315,7 +315,7 @@ enum ServiceInstaller {
 
 	// runs a shell script with administrator privileges. Bridges
 	// AdminShell.Error into ServiceInstaller.InstallError so the calling
-	// SettingsView UI gets a single error type to surface.
+	// SettingsView ui gets a single error type to surface.
 	private static func runWithAdminPrivileges(inScript: String) throws {
 		do {
 			_ = try AdminShell.run(inScript)

@@ -210,7 +210,7 @@ private struct VolumesTab: View {
 }
 
 // ===========================
-// MARK: Service tab
+// MARK: service tab
 // ===========================
 
 // ServiceTab manages the LaunchAgent / LaunchDaemon that keeps the index

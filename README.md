@@ -43,11 +43,13 @@ Root daemon mode needs **Full Disk Access** granted to its binary in **System Se
 ## Build from source
 
 ```bash
-./build-app.sh    # produces Allofit.app
-./build-dmg.sh    # produces Allofit-0.0.0.dmg
+./scripts/build-app.sh    # produces outputs/Allofit-0.0.0.app
+./scripts/build-dmg.sh    # produces outputs/Allofit-0.0.0.dmg
 ```
 
-`./clean.sh` wipes services, caches, prefs, and build artifacts for a fresh start.
+(The version is stamped into both the filename and the bundle's Info.plist. Pass `--version 1.2.3` or set `ALLOFIT_VERSION=1.2.3` to override.)
+
+`./scripts/clean.sh` wipes services, caches, prefs, and build artifacts (including `outputs/`) for a fresh start.
 
 ## License
 

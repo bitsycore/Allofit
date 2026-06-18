@@ -39,20 +39,22 @@ jobs:
         env:
           ALLOFIT_VERSION: ${{ steps.version.outputs.version }}
           ALLOFIT_BUILD: ${{ github.run_number }}
-        run: ./build-app.sh
+        run: ./scripts/build-app.sh
 
       - name: Zip Allofit.app (ditto preserves bundle metadata + signatures)
+        working-directory: outputs
         run: |
           ditto -c -k --keepParent --sequesterRsrc \
-            Allofit.app \
+            "Allofit-${{ steps.version.outputs.version }}.app" \
             "Allofit-${{ steps.version.outputs.version }}.zip"
 
       - name: Build DMG (drag-to-install with /Applications shortcut)
         env:
           ALLOFIT_VERSION: ${{ steps.version.outputs.version }}
-        run: ./build-dmg.sh --skip-build
+        run: ./scripts/build-dmg.sh --skip-build
 
       - name: SHA-256 checksums
+        working-directory: outputs
         run: |
           shasum -a 256 \
             "Allofit-${{ steps.version.outputs.version }}.zip" \
@@ -67,6 +69,6 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            Allofit-${{ steps.version.outputs.version }}.zip
-            Allofit-${{ steps.version.outputs.version }}.dmg
-            Allofit-${{ steps.version.outputs.version }}.sha256
+            outputs/Allofit-${{ steps.version.outputs.version }}.zip
+            outputs/Allofit-${{ steps.version.outputs.version }}.dmg
+            outputs/Allofit-${{ steps.version.outputs.version }}.sha256

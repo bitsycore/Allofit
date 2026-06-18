@@ -23,7 +23,7 @@ let package = Package(
 	targets: [
 		.executableTarget(
 			name: "Allofit",
-			path: "Sources/Allofit",
+			path: "sources",
 			swiftSettings: [
 				.swiftLanguageMode(.v5)
 			]

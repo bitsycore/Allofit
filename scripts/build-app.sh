@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Builds Allofit.app from the SwiftPM executable so the binary can be
 # launched like any other macOS app (double-click in Finder, dragged into
-# /Applications, etc.). Run from the project root:
-#     ./build-app.sh
-#     ./build-app.sh --version 1.0.0         # explicit version stamp
-#     ./build-app.sh -v 1.0.0 -b 42          # version + build number
-#     ALLOFIT_VERSION=1.0.0 ./build-app.sh   # env var still works
+# /Applications, etc.). Can be called from anywhere - paths are resolved
+# relative to the script's own location:
+#     ./scripts/build-app.sh                       # from project root
+#     scripts/build-app.sh --version 1.0.0
+#     ./build-app.sh -v 1.0.0 -b 42                # from scripts/
+#     ALLOFIT_VERSION=1.0.0 ./scripts/build-app.sh # env var still works
 #
 # Version precedence: --version arg > ALLOFIT_VERSION env > default 0.0.0.
-# The produced bundle ends up at ./Allofit.app.
+# The produced bundle ends up at <project root>/outputs/Allofit-<version>.app
+# (the version is appended so multiple builds can coexist in outputs/).
 #
 # Icon support (optional, first match wins):
 #     icons/Allofit.icns          - pre-built .icns, copied straight in
@@ -69,12 +71,17 @@ else
 	kBuildNumber="${ALLOFIT_BUILD:-0}"
 fi
 
-vProjectRoot="$(cd "$(dirname "$0")" && pwd)"
-vAppBundle="${vProjectRoot}/${kAppName}.app"
+# Resolve the project root from the script's own location (scripts/..),
+# so this script works regardless of the caller's CWD.
+vProjectRoot="$(cd "$(dirname "$0")/.." && pwd)"
+vOutputsDir="${vProjectRoot}/Outputs"
+vAppBundle="${vOutputsDir}/${kAppName}-${kVersion}.app"
 vMacOSDir="${vAppBundle}/Contents/MacOS"
 vResourcesDir="${vAppBundle}/Contents/Resources"
 vBinarySrc="${vProjectRoot}/.build/release/${kAppName}"
 vIconStagingDir="${vProjectRoot}/.build/icon-staging"
+
+mkdir -p "${vOutputsDir}"
 
 # ==================
 # MARK: Build binary

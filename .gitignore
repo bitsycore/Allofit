@@ -10,11 +10,10 @@ xcuserdata/
 DerivedData/
 *.xcuserstate
 
-# Build output produced by ./build-app.sh and ./build-dmg.sh
-Allofit.app/
-*.dmg
+# Build output produced by ./scripts/build-app.sh and ./scripts/build-dmg.sh
+outputs/
 
-# Service log files (also live in /tmp but local copies happen during dev)
+# service log files (also live in /tmp but local copies happen during dev)
 allofit-service.log
 allofit-service.err
 

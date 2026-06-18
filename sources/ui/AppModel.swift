@@ -91,7 +91,7 @@ final class AppModel: ObservableObject {
 	private var lastReloadAt: Date?
 
 	init() {
-		// no synchronous UI-state restoration needed; the cache file is
+		// no synchronous ui-state restoration needed; the cache file is
 		// loaded off-main in start() so the window appears instantly
 	}
 
@@ -233,7 +233,7 @@ final class AppModel: ObservableObject {
 	// the daemon, deletes its cache, and starts the daemon again so the
 	// daemon's fresh process performs the scan from scratch. The privileged
 	// portion runs on a detached task so the main thread (and the password
-	// dialog from NSAppleScript) doesn't freeze the UI.
+	// dialog from NSAppleScript) doesn't freeze the ui.
 	func performReindex() async {
 		if isIndexer {
 			reindex()
@@ -314,7 +314,7 @@ final class AppModel: ObservableObject {
 	}
 
 	// shared helper: runs a service-mode operation on a detached queue while
-	// publishing isWorking/workMessage so the UI can show progress. Returns
+	// publishing isWorking/workMessage so the ui can show progress. Returns
 	// true if the action ran without throwing.
 	@discardableResult
 	private func runPrivilegedAction(inLabel: String,
@@ -397,7 +397,7 @@ final class AppModel: ObservableObject {
 	// batched so we rebuild the path lookup once per batch (the per-event
 	// rebuild used previously was O(n × removals) on main and also left
 	// pathIndex with stale indices between iterations). MustScanSubDirs is
-	// handled off-main so a kernel history loss doesn't freeze the UI.
+	// handled off-main so a kernel history loss doesn't freeze the ui.
 	private func applyFileSystemChanges(inChanges: [FSChange]) {
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		var vChanged = false

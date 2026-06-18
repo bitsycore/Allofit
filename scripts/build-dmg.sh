@@ -3,21 +3,30 @@
 # distribution from the GitHub Releases page. The DMG opens to a window
 # with the .app and an /Applications symlink so the user can drag-install.
 #
-# Usage:
-#     ./build-dmg.sh                          # default version (0.0.0)
-#     ./build-dmg.sh --version 1.0.0          # explicit version
-#     ./build-dmg.sh -v 1.0.0 --skip-build    # version + skip rebuild
-#     ALLOFIT_VERSION=1.0.0 ./build-dmg.sh    # env var still works
+# Can be called from anywhere - paths are resolved relative to the
+# script's own location:
+#     ./scripts/build-dmg.sh                       # from project root
+#     scripts/build-dmg.sh --version 1.0.0
+#     ./build-dmg.sh -v 1.0.0 --skip-build          # from scripts/
+#     ALLOFIT_VERSION=1.0.0 ./scripts/build-dmg.sh  # env var still works
 #
 # Version precedence: --version arg > ALLOFIT_VERSION env > default 0.0.0.
-# Output: Allofit-<version>.dmg in the project root.
+# Output: <project root>/outputs/Allofit-<version>.dmg.
 set -euo pipefail
 
 kAppName="Allofit"
 
-vProjectRoot="$(cd "$(dirname "$0")" && pwd)"
-vAppBundle="${vProjectRoot}/${kAppName}.app"
+# Resolve the project root from the script's own location (scripts/..),
+# so this script works regardless of the caller's CWD.
+vProjectRoot="$(cd "$(dirname "$0")/.." && pwd)"
+vOutputsDir="${vProjectRoot}/outputs"
 vStagingDir="${vProjectRoot}/.build/dmg-staging"
+
+mkdir -p "${vOutputsDir}"
+
+# vAppBundle is set after kVersion is resolved below - the .app bundle's
+# filename includes the version, so we can't construct the path until we
+# know which version we're targeting.
 
 # ==================
 # MARK: Args
@@ -56,7 +65,8 @@ if [[ -n "$vVersionArg" ]]; then
 else
 	kVersion="${ALLOFIT_VERSION:-0.0.0}"
 fi
-vDmgPath="${vProjectRoot}/${kAppName}-${kVersion}.dmg"
+vDmgPath="${vOutputsDir}/${kAppName}-${kVersion}.dmg"
+vAppBundle="${vOutputsDir}/${kAppName}-${kVersion}.app"
 
 # ==================
 # MARK: Build .app
@@ -66,11 +76,11 @@ if [[ "$vSkipBuild" -eq 0 ]]; then
 	echo "==> Rebuilding ${kAppName}.app first"
 	# Propagate the resolved version into build-app.sh so the bundled
 	# Info.plist matches what we're naming the DMG.
-	ALLOFIT_VERSION="${kVersion}" "${vProjectRoot}/build-app.sh"
+	ALLOFIT_VERSION="${kVersion}" "${vProjectRoot}/scripts/build-app.sh"
 fi
 
 if [[ ! -d "${vAppBundle}" ]]; then
-	echo "Run ./build-app.sh first - ${kAppName}.app is missing" >&2
+	echo "Run ./scripts/build-app.sh first - ${kAppName}.app is missing" >&2
 	exit 1
 fi
 
