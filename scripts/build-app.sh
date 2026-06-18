@@ -74,7 +74,7 @@ fi
 # Resolve the project root from the script's own location (scripts/..),
 # so this script works regardless of the caller's CWD.
 vProjectRoot="$(cd "$(dirname "$0")/.." && pwd)"
-vOutputsDir="${vProjectRoot}/Outputs"
+vOutputsDir="${vProjectRoot}/outputs"
 vAppBundle="${vOutputsDir}/${kAppName}-${kVersion}.app"
 vMacOSDir="${vAppBundle}/Contents/MacOS"
 vResourcesDir="${vAppBundle}/Contents/Resources"
