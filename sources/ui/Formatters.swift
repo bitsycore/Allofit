@@ -26,7 +26,7 @@ enum Formatters {
 
 	// short date+time, with em-dash for sentinel "no date" values
 	static func date(_ inDate: Date) -> String {
-		if inDate.timeIntervalSince1970 < 1 { return "—" }
+		if inDate.timeIntervalSince1970 < 1 { return "-" }
 		return kDateFormatter.string(from: inDate)
 	}
 }

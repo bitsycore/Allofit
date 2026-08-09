@@ -208,7 +208,7 @@ struct ContentView: View {
 			.customizationID("path")
 
 			TableColumn("Size", value: \FileRecord.size) { vRecord in
-				Text(vRecord.isDirectory ? "—" : Formatters.size(bytes: vRecord.size))
+				Text(vRecord.isDirectory ? "-" : Formatters.size(bytes: vRecord.size))
 					.foregroundColor(.secondary)
 					.monospacedDigit()
 			}

@@ -374,7 +374,7 @@ private struct ServiceTab: View {
 					.font(.callout)
 			}
 			LabeledContent("Installed version") {
-				Text(vInstalledVer ?? "—")
+				Text(vInstalledVer ?? "-")
 					.font(.callout)
 					.monospacedDigit()
 			}
@@ -451,7 +451,7 @@ private struct CacheTab: View {
 						.monospacedDigit()
 				}
 				LabeledContent("Last modified") {
-					Text(cacheFileMtime() ?? "—")
+					Text(cacheFileMtime() ?? "-")
 						.font(.callout)
 						.monospacedDigit()
 				}
@@ -528,7 +528,7 @@ private struct CacheTab: View {
 
 	// formats a byte count as a human-friendly short string
 	private func formatSize(inBytes: Int64) -> String {
-		if inBytes <= 0 { return "—" }
+		if inBytes <= 0 { return "-" }
 		let vF = ByteCountFormatter()
 		vF.countStyle = .file
 		return vF.string(fromByteCount: inBytes)
@@ -548,8 +548,8 @@ private struct DiagnosticsTab: View {
 
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var model: AppModel
-	@State private var daemonStatus: String = "—"
-	@State private var serviceLogTail: String = "—"
+	@State private var daemonStatus: String = "-"
+	@State private var serviceLogTail: String = "-"
 	@State private var lastRefresh: Date = Date()
 
 	var body: some View {
@@ -577,7 +577,7 @@ private struct DiagnosticsTab: View {
 						.monospacedDigit()
 				}
 				LabeledContent("Cache mtime") {
-					Text(cacheMtimeString() ?? "—")
+					Text(cacheMtimeString() ?? "-")
 						.font(.callout)
 						.monospacedDigit()
 				}
@@ -699,7 +699,7 @@ private struct DiagnosticsTab: View {
 
 	// formats a byte count as a human-friendly short string
 	private func formatSize(_ inBytes: Int64) -> String {
-		if inBytes <= 0 { return "—" }
+		if inBytes <= 0 { return "-" }
 		let vF = ByteCountFormatter()
 		vF.countStyle = .file
 		return vF.string(fromByteCount: inBytes)

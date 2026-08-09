@@ -23,7 +23,7 @@ Requires macOS 15 (Sequoia) or newer.
 | `report` | any name containing "report" |
 | `Start*.pdf` | starts with "Start", ends with ".pdf" |
 | `IMG_????.heic` | "IMG_" + exactly 4 chars + ".heic" |
-| `*.png \| *.jpg` | OR — png or jpg |
+| `*.png \| *.jpg` | OR - png or jpg |
 
 ## Shortcuts
 

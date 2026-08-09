@@ -97,7 +97,7 @@ enum AllofitService {
 		) { vChanges in
 			NSLog("[Allofit] FSEvents batch: %d change(s) (sample: %@)",
 				  vChanges.count,
-				  vChanges.first?.path ?? "—")
+				  vChanges.first?.path ?? "-")
 			vState.lock.lock()
 			defer { vState.lock.unlock() }
 			var vRescanPrefixes: [String] = []

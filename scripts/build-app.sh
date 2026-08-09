@@ -197,7 +197,7 @@ cat > "${vAppBundle}/Contents/Info.plist" <<EOF
 	<key>CFBundleVersion</key>
 	<string>${kBuildNumber}</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>© 2026 bitsycore — MIT Licensed</string>
+	<string>© 2026 bitsycore - MIT Licensed</string>
 ${vIconPlistEntry}
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>

@@ -159,7 +159,7 @@ enum CLI {
 		for vScope in [ServiceInstaller.Scope.userAgent, .rootDaemon] {
 			let vInstalled = ServiceInstaller.isInstalled(inScope: vScope)
 			let vRunning = vInstalled && ServiceInstaller.isRunning(inScope: vScope)
-			let vVersion = ServiceInstaller.installedVersion(inScope: vScope) ?? "—"
+			let vVersion = ServiceInstaller.installedVersion(inScope: vScope) ?? "-"
 			let vState: String
 			if vRunning {
 				vState = "running"
