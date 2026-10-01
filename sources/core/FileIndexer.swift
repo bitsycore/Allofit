@@ -10,19 +10,20 @@ enum FileIndexer {
 
 	// the set of resource keys we ask for up front so they are pre-fetched in bulk
 	static let kPrefetchKeys: [URLResourceKey] = [
-		.nameKey,
 		.isDirectoryKey,
 		.fileSizeKey,
 		.creationDateKey,
 		.contentModificationDateKey,
-		.fileResourceIdentifierKey
+		.isHiddenKey
 	]
+	// same keys as a Set, built once instead of per record
+	private static let kPrefetchKeySet = Set(kPrefetchKeys)
 
 	// recursively walks inRoot, yielding records in batches via inBatch.
 	// The batched form lets long scans publish partial progress: the daemon
 	// can have its autosave write what it has so far while the rest of the
 	// filesystem is still being walked. Excluded paths and their descendants
-	// are pruned from the output.
+	// are pruned from the output, as are hidden entries and package contents.
 	static func walkRoot(inRoot: URL,
 						  inExclusions: ExclusionMatcher? = nil,
 						  inBatchSize: Int = 2000,
@@ -43,9 +44,11 @@ enum FileIndexer {
 
 		var vBatch: [FileRecord] = []
 		vBatch.reserveCapacity(inBatchSize)
+		// one String per directory instead of one per entry
+		let vInterner = PathInterner()
 
 		// include the root directory itself in the first batch
-		if let vRootRecord = makeRecord(inURL: inRoot) {
+		if let vRootRecord = makeRecord(inURL: inRoot, inInterner: vInterner) {
 			vBatch.append(vRootRecord)
 		}
 
@@ -66,7 +69,7 @@ enum FileIndexer {
 					return
 				}
 
-				if let vRecord = makeRecord(inURL: vURL) {
+				if let vRecord = makeRecord(inURL: vURL, inInterner: vInterner, inFresh: false) {
 					vBatch.append(vRecord)
 					if vBatch.count >= inBatchSize {
 						inBatch(vBatch)
@@ -80,16 +83,23 @@ enum FileIndexer {
 		}
 	}
 
+	// true when the item at inPath has the hidden flag (UF_HIDDEN or a
+	// dot-name) - the same test the walker's .skipsHiddenFiles applies
+	static func isHidden(inPath: String) -> Bool {
+		return autoreleasepool {
+			let vValues = try? URL(fileURLWithPath: inPath).resourceValues(forKeys: [.isHiddenKey])
+			return vValues?.isHidden ?? false
+		}
+	}
+
 	// convenience wrapper that materializes the full record list. Used by the
-	// GUI's in-process reindex (which builds everything before swapping the
-	// index in atomically). For the daemon, prefer walkRoot directly so the
-	// in-memory index grows incrementally and the autosave can persist partial
-	// progress while the scan continues.
+	// GUI's in-process reindex and subtree rescans. For the daemon, prefer
+	// walkRoot directly so the in-memory index grows incrementally and the
+	// autosave can persist partial progress while the scan continues.
 	static func indexRoot(inRoot: URL,
 						  inExclusions: ExclusionMatcher? = nil,
 						  inProgress: ((Int) -> Void)? = nil) -> [FileRecord] {
 		var vRecords: [FileRecord] = []
-		vRecords.reserveCapacity(100_000)
 		var vLastReport = Date.distantPast
 		let kReportInterval: TimeInterval = 0.25
 		walkRoot(inRoot: inRoot, inExclusions: inExclusions) { vBatch in
@@ -104,38 +114,66 @@ enum FileIndexer {
 		return vRecords
 	}
 
-	// builds a FileRecord from a URL's pre-fetched resource values.
-	// Clears the URL's resource-value cache first so we always re-stat the
-	// file - a file modified between two FSEvents batches would otherwise
-	// silently return the cached pre-edit mtime. Callers (walkRoot's
-	// enumerator loop, applyFileSystemChanges, AllofitService) already
-	// wrap each invocation in an autoreleasepool, so the autoreleased
-	// NSDate / NSNumber / NSURL objects from resourceValues() drain at
-	// the caller's pool boundary.
-	static func makeRecord(inURL: URL) -> FileRecord? {
+	// builds a FileRecord from a URL's resource values.
+	// inFresh clears the URL's resource-value cache first so we always
+	// re-stat the file - a file modified between two FSEvents batches would
+	// otherwise silently return the cached pre-edit mtime. The walker passes
+	// false because the enumerator's values were just bulk-fetched.
+	// inSkipHidden returns nil for hidden entries (dot-files, UF_HIDDEN),
+	// matching what the walker's .skipsHiddenFiles does. Callers wrap each
+	// invocation in an autoreleasepool.
+	static func makeRecord(inURL: URL,
+						   inInterner: PathInterner? = nil,
+						   inFresh: Bool = true,
+						   inSkipHidden: Bool = false) -> FileRecord? {
 		var vUrl = inURL
-		vUrl.removeAllCachedResourceValues()
-		guard let vValues = try? vUrl.resourceValues(forKeys: Set(kPrefetchKeys)) else {
+		if inFresh {
+			vUrl.removeAllCachedResourceValues()
+		}
+		guard let vValues = try? vUrl.resourceValues(forKeys: kPrefetchKeySet) else {
 			return nil
 		}
-		let vName = vValues.name ?? inURL.lastPathComponent
-		let vParent = inURL.deletingLastPathComponent().path
-		let vIsDir = vValues.isDirectory ?? false
-		let vSize = Int64(vValues.fileSize ?? 0)
-		let vCreated = vValues.creationDate ?? .distantPast
-		let vModified = vValues.contentModificationDate ?? .distantPast
-		// derive a stable identifier from the absolute path
-		var vHasher = Hasher()
-		vHasher.combine(inURL.path)
-		let vId = UInt64(bitPattern: Int64(vHasher.finalize()))
+		if inSkipHidden && (vValues.isHidden ?? false) {
+			return nil
+		}
+		// name/parent come from the path (not .nameKey) so that
+		// parentPath + "/" + name always round-trips to the watched path,
+		// which is what the id and the parent-is-indexed rule rely on
+		let vPath = inURL.path
+		let vName: String
+		let vParentRaw: String
+		if vPath == "/" {
+			vName = "/"
+			vParentRaw = ""
+		} else {
+			vName = inURL.lastPathComponent
+			vParentRaw = inURL.deletingLastPathComponent().path
+		}
+		let vParent = inInterner?.intern(vParentRaw) ?? vParentRaw
 		return FileRecord(
-			id: vId,
 			name: vName,
 			parentPath: vParent,
-			size: vSize,
-			dateCreated: vCreated,
-			dateModified: vModified,
-			isDirectory: vIsDir
+			size: Int64(vValues.fileSize ?? 0),
+			dateCreated: vValues.creationDate ?? .distantPast,
+			dateModified: vValues.contentModificationDate ?? .distantPast,
+			isDirectory: vValues.isDirectory ?? false
 		)
+	}
+}
+
+// PathInterner hands back one shared String instance per distinct value,
+// so the thousands of records of a directory share a single parentPath
+// buffer instead of each holding its own copy. Not thread-safe: use one
+// per walk / load.
+final class PathInterner {
+
+	// distinct value -> shared instance
+	private var table: [String: String] = [:]
+
+	// returns the shared instance equal to inString
+	func intern(_ inString: String) -> String {
+		if let vShared = table[inString] { return vShared }
+		table[inString] = inString
+		return inString
 	}
 }

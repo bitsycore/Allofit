@@ -48,16 +48,23 @@ enum VolumeManager {
 	}
 
 	// returns the effective root URLs combining configured paths and mounted
-	// volumes that match the include-mounted / include-network preferences
+	// volumes that match the include-mounted / include-network preferences.
+	// Paths are standardized and nested roots dropped (a root inside another
+	// root would otherwise be walked, watched and indexed twice).
 	static func effectiveRoots(inPreferences: Preferences) -> [URL] {
-		var vRoots: [URL] = inPreferences.rootPaths.map { URL(fileURLWithPath: $0) }
+		var vPaths: [String] = inPreferences.rootPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
 		if inPreferences.includeMountedVolumes || inPreferences.includeNetworkVolumes {
 			for vVol in mountedVolumes() {
 				if vVol.isNetwork && !inPreferences.includeNetworkVolumes { continue }
 				if !vVol.isNetwork && !inPreferences.includeMountedVolumes { continue }
-				vRoots.append(vVol.url)
+				vPaths.append(vVol.url.standardizedFileURL.path)
 			}
 		}
-		return vRoots
+		let vMinimal = Set(SubtreeMatcher.minimalRoots(inPaths: vPaths))
+		// keep the user's order, minus duplicates and nested entries
+		var vSeen = Set<String>()
+		return vPaths
+			.filter { vMinimal.contains($0) && vSeen.insert($0).inserted }
+			.map { URL(fileURLWithPath: $0) }
 	}
 }

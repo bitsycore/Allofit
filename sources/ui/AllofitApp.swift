@@ -8,8 +8,11 @@ struct AllofitApp: App {
 	// AppKit delegate that wrestles focus from whichever app was frontmost,
 	// needed because SwiftPM-launched binaries default to .accessory policy
 	@NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-	// shared application state injected into the view tree
-	@StateObject private var model = AppModel()
+	// shared application state injected into the view tree. Held with
+	// @State (not @StateObject) so the App does not subscribe to it: the
+	// model's counters change on every index update, and observing them
+	// here would re-evaluate every scene each time.
+	@State private var model = AppModel()
 	// session-scoped store of sudo-staged user-readable copies. Sits
 	// alongside AppModel so both the Table (lock badge on rows) and
 	// the PreviewPane observe the same authorization state.
@@ -86,6 +89,12 @@ struct AllofitWindowContent: View {
 			.environmentObject(searchModel)
 			.frame(minWidth: 760, minHeight: 480)
 			.background(MainWindowMarker())
+			.onAppear {
+				model.start()
+			}
+			.onDisappear {
+				model.saveCache()
+			}
 	}
 }
 

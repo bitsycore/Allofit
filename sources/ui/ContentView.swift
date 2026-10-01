@@ -7,7 +7,9 @@ import AppKit
 // the right (toggleable via the toolbar), and a status bar at the bottom.
 struct ContentView: View {
 
-	@EnvironmentObject var model: AppModel
+	// AppModel is intentionally not observed here: its counters change on
+	// every index update and would re-evaluate this body (and the Table)
+	// each time. StatusBarView observes it instead.
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var access: AccessManager
 	// per-window search model: owns this window's query + filtered slice so
@@ -80,12 +82,6 @@ struct ContentView: View {
 				}
 				.help("Preferences (⌘,)")
 			}
-		}
-		.onAppear {
-			model.start()
-		}
-		.onDisappear {
-			model.saveCache()
 		}
 		.onChange(of: columnCustomization) { _, vNew in
 			// Debounced + off-main save. SwiftUI fires onChange on every
@@ -342,12 +338,16 @@ private struct StatusBarView: View {
 
 	var body: some View {
 		HStack(spacing: 8) {
-			if model.isIndexing {
+			if model.isLoadingCache {
 				ProgressView()
 					.controlSize(.small)
-				Text("Indexing…  \(model.indexedCount) entries")
+				Text("Loading index…")
+			} else if model.isIndexing {
+				ProgressView()
+					.controlSize(.small)
+				Text("Indexing…  \(model.indexedCount.formatted()) entries")
 			} else {
-				Text("\(searchModel.visibleRecords.count) shown  ·  \(model.indexedCount) indexed")
+				Text(resultsText)
 			}
 			Spacer()
 			Text(model.isIndexer ? "Indexer" : "Reader")
@@ -365,5 +365,16 @@ private struct StatusBarView: View {
 		.padding(.vertical, 4)
 		.font(.caption)
 		.foregroundColor(.secondary)
+	}
+
+	// "N results" plus how many are listed when the list is capped
+	private var resultsText: String {
+		let vMatches = searchModel.matchCount
+		let vShown = searchModel.visibleRecords.count
+		let vIndexed = model.indexedCount.formatted()
+		if vShown < vMatches {
+			return "\(vMatches.formatted()) results (first \(vShown.formatted()) listed)  ·  \(vIndexed) indexed"
+		}
+		return "\(vMatches.formatted()) results  ·  \(vIndexed) indexed"
 	}
 }

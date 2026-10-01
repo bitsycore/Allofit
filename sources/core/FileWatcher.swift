@@ -10,7 +10,14 @@ struct FSChange {
 	let path: String
 	// raw FSEvents flag bits for this change
 	let flags: FSEventStreamEventFlags
+	// FSEvents id of this change, persisted so the next launch resumes after it
+	let eventId: FSEventStreamEventId
 
+	// true for the synthetic marker FSEvents sends once the replay of
+	// historical events (sinceWhen) is finished - not a real file change
+	var isHistoryDone: Bool {
+		return flags & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone) != 0
+	}
 	// true when the kernel asks the client to rescan inside this path
 	// because events were dropped (history too old or buffer overflow)
 	var mustScanSubDirs: Bool {
@@ -75,7 +82,7 @@ final class FileWatcher: @unchecked Sendable {
 		)
 
 		// C callback: forwards paths + flags back to the Swift handler
-		let vCallback: FSEventStreamCallback = { (_, info, numEvents, eventPaths, eventFlags, _) in
+		let vCallback: FSEventStreamCallback = { (_, info, numEvents, eventPaths, eventFlags, eventIds) in
 			guard let vInfo = info else { return }
 			let vWatcher = Unmanaged<FileWatcher>.fromOpaque(vInfo).takeUnretainedValue()
 			let vPathsArray = unsafeBitCast(eventPaths, to: NSArray.self)
@@ -83,7 +90,7 @@ final class FileWatcher: @unchecked Sendable {
 			vChanges.reserveCapacity(numEvents)
 			for vI in 0..<numEvents {
 				guard let vPath = vPathsArray[vI] as? String else { continue }
-				vChanges.append(FSChange(path: vPath, flags: eventFlags[vI]))
+				vChanges.append(FSChange(path: vPath, flags: eventFlags[vI], eventId: eventIds[vI]))
 			}
 			vWatcher.lock.lock()
 			let vHandler = vWatcher.handler

@@ -64,7 +64,7 @@ private struct RootsTab: View {
 					.font(.caption)
 					.foregroundColor(.secondary)
 			}
-			Text("Changes take effect on the next reindex. In service mode this stops the daemon, deletes its cache, and restarts it so the fresh process re-scans from scratch.")
+			Text("In built-in mode, changes apply automatically: new folders are scanned and removed ones dropped from the index. With a service, they apply when the service restarts; Reindex now stops the daemon, deletes its cache, and restarts it so the fresh process re-scans from scratch.")
 				.font(.caption)
 				.foregroundColor(.secondary)
 		}
@@ -131,7 +131,7 @@ private struct ExclusionsTab: View {
 					.disabled(selection == nil)
 				Spacer()
 			}
-			Text("Entries match exact paths and any descendants. Changes apply on next reindex.")
+			Text("Entries match exact paths and any descendants. In built-in mode, matching entries are removed from the index right away.")
 				.font(.caption)
 				.foregroundColor(.secondary)
 		}

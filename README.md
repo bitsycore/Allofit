@@ -18,12 +18,24 @@ Requires macOS 15 (Sequoia) or newer.
 
 ## Search
 
+Same syntax as Everything:
+
 | Type… | …to match |
 |---|---|
-| `report` | any name containing "report" |
+| `report` | any name containing "report" (case-insensitive) |
+| `annual report` | names containing "annual" **and** "report" |
 | `Start*.pdf` | starts with "Start", ends with ".pdf" |
 | `IMG_????.heic` | "IMG_" + exactly 4 chars + ".heic" |
-| `*.png \| *.jpg` | OR - png or jpg |
+| `*.png \| *.jpg` | OR - png or jpg (OR binds tighter than the space AND) |
+| `report !draft` | NOT - names with "report" but without "draft" |
+| `"my file"` | quotes keep spaces inside one term |
+| `ext:pdf;docx` | by extension |
+| `file:` / `folder:` | files only / folders only, alone or as a prefix (`folder:build`) |
+| `src/main` | a term with `/` matches against the full path |
+| `"some/folder/**/path" IMG_????.heic` | path wildcards: `*` stays inside one folder name, `**` spans any number of folders (zero too) |
+| `photos/**/` | a trailing `/` means anything inside that folder |
+
+The list shows the first 2,000 results in the chosen order; the status bar shows the total count.
 
 ## Shortcuts
 

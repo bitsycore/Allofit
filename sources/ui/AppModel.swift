@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 import CoreServices
 
 // Background-thread-safe last-seen-mtime cell for the cache-file poll.
@@ -23,23 +24,71 @@ private final class BackgroundMtime: @unchecked Sendable {
 	}
 }
 
+// Thread-safe accumulator for FSEvents batches. The FSEvents callback appends
+// here from its own queue and only schedules a flush when none is pending, so
+// a replay that delivers thousands of batches in a burst becomes a handful of
+// coalesced flushes instead of thousands of main-queue hops.
+private final class PendingChanges: @unchecked Sendable {
+	// changes received since the last drain
+	private var changes: [FSChange] = []
+	// true while a flush is scheduled but has not drained yet
+	private var flushScheduled = false
+	// guards changes and flushScheduled
+	private let lock = NSLock()
+
+	// appends a batch; returns true if the caller must schedule a flush
+	func append(inChanges: [FSChange]) -> Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		changes.append(contentsOf: inChanges)
+		if flushScheduled { return false }
+		flushScheduled = true
+		return true
+	}
+
+	// takes every pending change and re-arms flush scheduling
+	func drain() -> [FSChange] {
+		lock.lock()
+		defer { lock.unlock() }
+		let vResult = changes
+		changes = []
+		flushScheduled = false
+		return vResult
+	}
+
+	// discards pending changes (used when the watcher is torn down)
+	func reset() {
+		_ = drain()
+	}
+}
+
 // AppModel is the shared backing state for the application.
 // It owns the in-memory file index, drives the background indexer and the
 // FSEvents watcher, and exposes the active sort descriptor. The per-window
 // search query and filtered/visible slice live in WindowSearchModel so two
 // windows can run independent searches against this same shared index.
 //
-// Threading rule of thumb: this class is @MainActor so all Published properties
-// are written from main. Heavy work (LZ4 (de)compression, filtering, sorting,
-// path-lookup rebuilds, filesystem walks) happens on background queues; the
-// result is then assigned back on main with DispatchQueue.main.async or
-// MainActor.run. Snapshots of value types (Array, String) cross thread
-// boundaries via Swift COW semantics, so no defensive copies are needed.
+// Threading rule of thumb: this class is @MainActor so all state is written
+// from main. Heavy work (LZ4 (de)compression, filtering, sorting, pruning,
+// filesystem walks and stats) happens on background queues; the result is
+// then merged back on main. Snapshots of value types (Array, IndexState)
+// cross thread boundaries via Swift COW semantics.
+//
+// The record array is deliberately NOT @Published: every mutation of a
+// @Published array emits the whole array, and any subscriber that buffers
+// those values (receive(on:)) forces a full copy of the index per change -
+// that is what used to blow up to tens of GB during an FSEvents replay.
+// Views observe the small @Published counters; search models listen to the
+// payload-free recordsChanged signal and read allRecords when they refilter.
 @MainActor
 final class AppModel: ObservableObject {
 
-	// the canonical full index of every entry observed so far
-	@Published private(set) var allRecords: [FileRecord] = []
+	// the canonical index (records + id lookup), main-thread only
+	private var index = IndexState()
+	// every entry observed so far, in no particular order
+	var allRecords: [FileRecord] { index.records }
+	// fires on main after allRecords changed (no payload by design)
+	let recordsChanged = PassthroughSubject<Void, Never>()
 	// total number of entries indexed (used for the status bar)
 	@Published private(set) var indexedCount: Int = 0
 	// true while a full reindex is in progress
@@ -51,6 +100,10 @@ final class AppModel: ObservableObject {
 
 	// how often the index is written to disk while running (seconds)
 	private let kAutosaveSeconds: TimeInterval = 30
+	// delay used to coalesce FSEvents batches before resolving them
+	private let kChangeCoalesceSeconds: TimeInterval = 0.5
+	// delay before a roots / exclusions edit is applied to the live index
+	private let kConfigDebounceSeconds: TimeInterval = 1.0
 
 	private let prefs = Preferences.shared
 	// background queues isolated by concern - keeps the slow stuff off main
@@ -60,18 +113,25 @@ final class AppModel: ObservableObject {
 	private let watcher = FileWatcher()
 	// watcher used in reader mode to detect cache file refreshes
 	private let cacheWatcher = FileWatcher()
-	// path -> array index, kept in sync with allRecords (main-thread only)
-	private var pathIndex: [String: Int] = [:]
+	// FSEvents batches waiting to be resolved and applied (indexer mode)
+	private let pendingChanges = PendingChanges()
+	// roots the watcher was started with; their own records need no parent
+	private var watchedRoots: Set<String> = []
+	// bumped whenever the whole index is replaced, so a subtree rescan that
+	// started against the previous index doesn't merge into the new one
+	private var indexGeneration = 0
 	// autosave timer when running in indexer mode
 	private var autosaveTimer: Timer?
-	// true when allRecords has changed since the last save
+	// true when the index has changed since the last save
 	private var dirty = false
-	// last FSEvents event id known to be reflected in allRecords
+	// last FSEvents event id known to be reflected in the index
 	private var lastEventId: UInt64 = 0
 	// process-wide indexer mutex (nil until acquired)
 	private var indexerLock: IndexerLock?
 	// guards start() from running twice across window close/reopen
 	private var hasStarted = false
+	// subscriptions to Preferences / app lifecycle
+	private var cancellables: Set<AnyCancellable> = []
 	// true while a privileged service operation is in flight (Reindex / Clear)
 	@Published private(set) var isWorking: Bool = false
 	// last user-facing status string for the Settings buttons
@@ -91,8 +151,30 @@ final class AppModel: ObservableObject {
 	private var lastReloadAt: Date?
 
 	init() {
-		// no synchronous ui-state restoration needed; the cache file is
-		// loaded off-main in start() so the window appears instantly
+		// the cache file is loaded off-main in start() so the window
+		// appears instantly; here we only wire up observers.
+		// Persist on Cmd+Q: the autosave only runs every 30 s and an async
+		// save would be killed with the process.
+		NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
+			.sink { [weak self] _ in
+				MainActor.assumeIsolated {
+					self?.saveCacheNow()
+				}
+			}
+			.store(in: &cancellables)
+		// apply roots / exclusions / volume edits to the live index
+		Publishers.Merge4(
+			prefs.$rootPaths.map { _ in () },
+			prefs.$excludedPaths.map { _ in () },
+			prefs.$includeMountedVolumes.map { _ in () },
+			prefs.$includeNetworkVolumes.map { _ in () }
+		)
+		.dropFirst(4)
+		.debounce(for: .seconds(kConfigDebounceSeconds), scheduler: DispatchQueue.main)
+		.sink { [weak self] in
+			self?.applyConfigurationChange()
+		}
+		.store(in: &cancellables)
 	}
 
 	// kicks off background activity for the first time. Subsequent calls are
@@ -118,6 +200,7 @@ final class AppModel: ObservableObject {
 	private func tearDownActiveMode() {
 		watcher.stop()
 		cacheWatcher.stop()
+		pendingChanges.reset()
 		autosaveTimer?.invalidate()
 		autosaveTimer = nil
 		cachePollSource?.cancel()
@@ -146,32 +229,33 @@ final class AppModel: ObservableObject {
 
 		isLoadingCache = true
 		let vCacheURL = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
+		let vIsIndexer = isIndexer
+		let vRoots = Set(VolumeManager.effectiveRoots(inPreferences: prefs).map { $0.path })
+		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		NSLog("[Allofit GUI] bootstrap: serviceMode=%@ isIndexer=%@ cacheURL=%@",
 			  prefs.serviceMode.rawValue,
-			  isIndexer ? "true" : "false",
+			  vIsIndexer ? "true" : "false",
 			  vCacheURL.path)
 		ioQueue.async { [weak self] in
-			// decompress + parse off-main (this is the expensive part)
+			// decompress + parse + reconcile off-main (the expensive part)
 			let vCache = IndexStore.load(from: vCacheURL)
-			// build the path lookup while we are already off-main
-			let vLookup = AppModel.buildPathLookup(inRecords: vCache?.records ?? [])
+			var vState = IndexState(inRecords: vCache?.records ?? [])
+			// as the indexer, drop what no longer matches the configuration
+			// (removed roots, new exclusions, orphans from older versions)
+			let vPruned = vIsIndexer ? vState.prune(inRoots: vRoots, inExclusions: vMatcher, inIsHidden: FileIndexer.isHidden) : 0
 			DispatchQueue.main.async {
 				guard let vSelf = self else { return }
 				if let vCache = vCache {
-					NSLog("[Allofit GUI] loaded %d records from cache", vCache.records.count)
-					vSelf.allRecords = vCache.records
-					vSelf.pathIndex = vLookup
-					vSelf.indexedCount = vCache.records.count
+					NSLog("[Allofit GUI] loaded %d records from cache (%d pruned)",
+						  vState.count, vPruned)
 					vSelf.lastEventId = vCache.lastEventId
 				} else {
 					NSLog("[Allofit GUI] cache load returned nil (file missing or invalid)")
-					vSelf.allRecords = []
-					vSelf.pathIndex = [:]
-					vSelf.indexedCount = 0
+					vSelf.lastEventId = 0
 				}
+				vSelf.replaceIndex(inState: vState)
+				vSelf.dirty = vPruned > 0
 				vSelf.isLoadingCache = false
-				// WindowSearchModel(s) observe allRecords and will refilter;
-				// no need to kick a filter here ourselves
 				if vSelf.isIndexer {
 					vSelf.startIndexerMode()
 				} else {
@@ -202,7 +286,6 @@ final class AppModel: ObservableObject {
 		let vStartId = UInt64(FSEventsGetCurrentEventId())
 		indexQueue.async { [weak self] in
 			var vAccumulated: [FileRecord] = []
-			vAccumulated.reserveCapacity(200_000)
 			for vRoot in vRoots {
 				// per-root autoreleasepool so the file-enumeration's
 				// autoreleased NSURL/NSDate/NSNumber objects don't pile
@@ -217,13 +300,12 @@ final class AppModel: ObservableObject {
 					vAccumulated.append(contentsOf: vList)
 				}
 			}
-			let vFinal = vAccumulated
-			let vLookup = AppModel.buildPathLookup(inRecords: vFinal)
+			let vState = IndexState(inRecords: vAccumulated)
 			// persist off-main before bouncing back so main never sees the
 			// LZ4 compression cost
-			IndexStore.save(inRecords: vFinal, inLastEventId: vStartId)
+			IndexStore.save(inRecords: vState.records, inLastEventId: vStartId)
 			DispatchQueue.main.async {
-				self?.applyFreshIndex(inRecords: vFinal, inLookup: vLookup, inEventId: vStartId)
+				self?.applyFreshIndex(inState: vState, inEventId: vStartId)
 			}
 		}
 	}
@@ -343,14 +425,29 @@ final class AppModel: ObservableObject {
 		}
 	}
 
-	// writes the current index to disk (called on quit and by autosave)
+	// writes the current index to disk (autosave, window close, replay end).
+	// Snapshots on main (cheap COW), compresses off-main.
 	func saveCache() {
 		guard isIndexer else { return }
-		// snapshot on main (cheap COW), then dispatch compression off-main
-		let vRecords = allRecords
-		let vEventId = max(lastEventId, watcher.latestEventId)
+		let vRecords = index.records
+		// lastEventId tracks what is actually merged into the index; the
+		// stream's latest id can be ahead (changes still being resolved),
+		// and saving that would make the next launch skip those changes
+		let vEventId = lastEventId
 		dirty = false
 		ioQueue.async {
+			IndexStore.save(inRecords: vRecords, inLastEventId: vEventId)
+		}
+	}
+
+	// synchronous save used at quit; ioQueue.sync also waits for any
+	// asynchronous save still in flight so the newest state wins
+	private func saveCacheNow() {
+		guard isIndexer, dirty else { return }
+		let vRecords = index.records
+		let vEventId = lastEventId
+		dirty = false
+		ioQueue.sync {
 			IndexStore.save(inRecords: vRecords, inLastEventId: vEventId)
 		}
 	}
@@ -359,23 +456,62 @@ final class AppModel: ObservableObject {
 	// MARK: Indexer mode
 	// ===========================
 
+	// starts live updates after the cache was loaded. Falls back to a full
+	// reindex when there is no cache, and to background rescans when the
+	// saved event id can't be replayed or a configured root is missing.
 	private func startIndexerMode() {
-		if allRecords.isEmpty {
-			reindex()
-		} else {
-			startWatching(inSinceWhen: lastEventId)
-		}
 		startAutosaveTimer()
+		if index.count == 0 {
+			reindex()
+			return
+		}
+		let vRoots = VolumeManager.effectiveRoots(inPreferences: prefs).map { $0.path }
+		let vCurrentId = UInt64(FSEventsGetCurrentEventId())
+		if lastEventId == 0 || lastEventId > vCurrentId {
+			// the id is from another FSEvents database (volume erased,
+			// cache copied from another Mac...): replay would silently
+			// deliver nothing, so re-walk everything in the background
+			// while the cached results stay searchable
+			NSLog("[Allofit GUI] saved event id %llu not replayable (current %llu), rescanning roots",
+				  lastEventId, vCurrentId)
+			lastEventId = vCurrentId
+			startWatching(inSinceWhen: vCurrentId)
+			kickRescanSubtrees(inPaths: vRoots)
+			return
+		}
+		startWatching(inSinceWhen: lastEventId)
+		// roots added since the cache was written have never been walked
+		let vMissing = vRoots.filter { !index.contains(inPath: $0) }
+		if !vMissing.isEmpty {
+			kickRescanSubtrees(inPaths: vMissing)
+		}
 	}
 
+	// starts the FSEvents watcher from inSinceWhen. Batches are coalesced in
+	// pendingChanges, resolved (stat'ed) on indexQueue, and only the final
+	// in-memory merge runs on main - so replaying days of history after a
+	// relaunch neither floods the main queue nor freezes the ui.
 	private func startWatching(inSinceWhen: UInt64) {
-		let vRoots = VolumeManager.effectiveRoots(inPreferences: prefs)
+		let vRoots = VolumeManager.effectiveRoots(inPreferences: prefs).map { $0.path }
+		watchedRoots = Set(vRoots)
+		pendingChanges.reset()
+		let vPending = pendingChanges
+		let vQueue = indexQueue
+		let vDelay = kChangeCoalesceSeconds
+		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		watcher.start(
-			inRoots: vRoots.map { $0.path },
+			inRoots: vRoots,
 			inSinceWhen: FSEventStreamEventId(inSinceWhen)
-		) { vChanges in
-			DispatchQueue.main.async { [weak self] in
-				self?.applyFileSystemChanges(inChanges: vChanges)
+		) { [weak self] vChanges in
+			guard vPending.append(inChanges: vChanges) else { return }
+			vQueue.asyncAfter(deadline: .now() + vDelay) { [weak self] in
+				let vResolved = IndexState.resolve(
+					inChanges: vPending.drain(),
+					inExclusions: vMatcher
+				)
+				DispatchQueue.main.async {
+					self?.applyResolvedChanges(inResolved: vResolved)
+				}
 			}
 		}
 	}
@@ -393,103 +529,84 @@ final class AppModel: ObservableObject {
 		autosaveTimer = vTimer
 	}
 
-	// applies a batch of FSEvents-reported changes. Updates and removals are
-	// batched so we rebuild the path lookup once per batch (the per-event
-	// rebuild used previously was O(n × removals) on main and also left
-	// pathIndex with stale indices between iterations). MustScanSubDirs is
-	// handled off-main so a kernel history loss doesn't freeze the ui.
-	private func applyFileSystemChanges(inChanges: [FSChange]) {
-		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
-		var vChanged = false
-		var vRescan: [String] = []
-		var vRemoved: Set<String> = []
-
-		for vChange in inChanges {
-			if vMatcher.isExcluded(inPath: vChange.path) { continue }
-			if vChange.mustScanSubDirs {
-				vRescan.append(vChange.path)
-				continue
-			}
-			// skip paths we've already queued for removal in this batch
-			if vRemoved.contains(vChange.path) { continue }
-			let vURL = URL(fileURLWithPath: vChange.path)
-			let vExists = (try? vURL.checkResourceIsReachable()) ?? false
-			if vExists, let vRecord = FileIndexer.makeRecord(inURL: vURL) {
-				if let vIdx = pathIndex[vRecord.fullPath] {
-					allRecords[vIdx] = vRecord
-				} else {
-					allRecords.append(vRecord)
-					pathIndex[vRecord.fullPath] = allRecords.count - 1
-				}
-				vChanged = true
-			} else if pathIndex[vChange.path] != nil {
-				// defer the actual removal so we can bulk-remove all at once
-				// at the end of the batch, then rebuild the lookup once
-				vRemoved.insert(vChange.path)
-				vChanged = true
-			}
-		}
-
-		if !vRemoved.isEmpty {
-			// one bulk pass over allRecords + one lookup rebuild per batch
-			allRecords.removeAll { vRemoved.contains($0.fullPath) }
-			rebuildPathLookup()
-		}
-
-		if !vRescan.isEmpty {
-			kickRescanSubtrees(inPaths: vRescan, inExclusions: vMatcher)
-		}
-
-		if vChanged {
-			indexedCount = allRecords.count
-			lastEventId = watcher.latestEventId
+	// merges a resolved set of FSEvents changes into the index (pure
+	// in-memory work; the stats were done off-main by IndexState.resolve)
+	private func applyResolvedChanges(inResolved: ResolvedChanges) {
+		guard isIndexer else { return }
+		let vResult = index.apply(inChanges: inResolved, inRoots: watchedRoots)
+		lastEventId = max(lastEventId, inResolved.maxEventId)
+		if vResult.changed {
 			dirty = true
-			// WindowSearchModel(s) observe @Published allRecords and refilter
-			// on debounce; no need to fire a manual filter pass here
+			publishRecords()
+		}
+		if !vResult.rescans.isEmpty {
+			kickRescanSubtrees(inPaths: vResult.rescans)
+		}
+		// persist right after a relaunch replay finishes so the next launch
+		// resumes from here instead of replaying the same history again
+		if inResolved.historyDone {
+			NSLog("[Allofit GUI] FSEvents history replay done, saving cache")
+			saveCache()
 		}
 	}
 
-	// rebuilds the entries below the given subtrees from the filesystem in
-	// the background, then hands the new arrays back to main in one shot
-	private func kickRescanSubtrees(inPaths: [String], inExclusions: ExclusionMatcher) {
-		let vCurrent = allRecords
-		let vPrefixes = inPaths.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+	// re-walks the given subtrees in the background, then swaps their
+	// content in on main. Used for kernel-requested rescans, folders that
+	// were moved/renamed into the tree, and newly added roots.
+	private func kickRescanSubtrees(inPaths: [String]) {
+		let vRoots = SubtreeMatcher.minimalRoots(inPaths: inPaths)
+		guard !vRoots.isEmpty else { return }
+		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
+		let vGeneration = indexGeneration
 		indexQueue.async { [weak self] in
-			var vKept = vCurrent.filter { vRec in
-				let vP = vRec.fullPath
-				for vPre in vPrefixes where vP == String(vPre.dropLast()) || vP.hasPrefix(vPre) {
-					return false
-				}
-				return true
-			}
-			for vPath in inPaths {
-				// per-subtree autoreleasepool keeps the rescan's
-				// autoreleased URL/stat objects from accumulating across
-				// subtrees inside this long-running async block
+			var vRecords: [FileRecord] = []
+			for vPath in vRoots {
+				// per-subtree autoreleasepool keeps the walk's autoreleased
+				// URL/stat objects from accumulating across subtrees
 				autoreleasepool {
-					let vList = FileIndexer.indexRoot(
+					vRecords.append(contentsOf: FileIndexer.indexRoot(
 						inRoot: URL(fileURLWithPath: vPath),
-						inExclusions: inExclusions
-					)
-					vKept.append(contentsOf: vList)
+						inExclusions: vMatcher
+					))
 				}
 			}
-			let vFinal = vKept
-			let vLookup = AppModel.buildPathLookup(inRecords: vFinal)
+			let vFinal = vRecords
 			DispatchQueue.main.async {
-				self?.allRecords = vFinal
-				self?.pathIndex = vLookup
-				self?.indexedCount = vFinal.count
-				self?.dirty = true
+				guard let vSelf = self, vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
+				vSelf.index.replaceSubtrees(inRoots: vRoots, inRecords: vFinal)
+				vSelf.dirty = true
+				vSelf.publishRecords()
 			}
 		}
 	}
 
-	// rebuilds the path -> array-index dictionary from allRecords. Called
-	// synchronously on main after batched removals so the subsequent code
-	// sees a consistent pathIndex. One-shot O(n) per FSEvents batch.
-	private func rebuildPathLookup() {
-		pathIndex = AppModel.buildPathLookup(inRecords: allRecords)
+	// applies edited roots / exclusions / volume options to the live index
+	// without a full reindex: prunes what fell out of scope, walks roots
+	// that are new, and restarts the watcher on the new root set
+	private func applyConfigurationChange() {
+		guard isIndexer, !isIndexing, !isLoadingCache else { return }
+		NSLog("[Allofit GUI] configuration changed, reconciling index")
+		let vRoots = VolumeManager.effectiveRoots(inPreferences: prefs).map { $0.path }
+		let vRootSet = Set(vRoots)
+		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
+		let vState = index
+		let vGeneration = indexGeneration
+		watcher.stop()
+		indexQueue.async { [weak self] in
+			var vPruned = vState
+			let vRemoved = vPruned.prune(inRoots: vRootSet, inExclusions: vMatcher, inIsHidden: FileIndexer.isHidden)
+			DispatchQueue.main.async {
+				guard let vSelf = self, vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
+				NSLog("[Allofit GUI] reconcile: %d records pruned", vRemoved)
+				vSelf.replaceIndex(inState: vPruned)
+				vSelf.dirty = true
+				vSelf.startWatching(inSinceWhen: vSelf.lastEventId)
+				let vMissing = vRoots.filter { !vSelf.index.contains(inPath: $0) }
+				if !vMissing.isEmpty {
+					vSelf.kickRescanSubtrees(inPaths: vMissing)
+				}
+			}
+		}
 	}
 
 	// ===========================
@@ -506,7 +623,7 @@ final class AppModel: ObservableObject {
 		// when the cache file itself changed - other files in the dir
 		// (indexer.lock, .tmp atomic-rename leftovers, etc.) used to also
 		// trigger main.async hops, which contributed to dropped clicks.
-		cacheWatcher.start(inRoots: [vDir]) { vChanges in
+		cacheWatcher.start(inRoots: [vDir]) { [weak self] vChanges in
 			let vCacheChanged = vChanges.contains(where: { $0.path == vTarget })
 			guard vCacheChanged else { return }
 			NSLog("[Allofit GUI] cache file changed (FSEvents), reloading")
@@ -544,11 +661,7 @@ final class AppModel: ObservableObject {
 	//   1. lastEventId comparison - the daemon advances its event id every
 	//      time it actually persists new state, so a matching id means the
 	//      records on disk are identical to what we have and we can bail
-	//      before touching any @Published. This is what was eating clicks:
-	//      the daemon resaving an unchanged cache still bumped its mtime,
-	//      the poller triggered a reload, and the resulting @Published
-	//      cascade re-rendered the Table at the exact moment the user
-	//      was clicking a row.
+	//      before touching any published state.
 	//   2. A 1-second floor between reloads. Even when changes do happen,
 	//      we don't need to re-render the whole list at FSEvents' rate -
 	//      the next tick will catch any newer state.
@@ -560,21 +673,20 @@ final class AppModel: ObservableObject {
 		lastReloadAt = vNow
 		let vUrl = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
 		let vCurrentEventId = lastEventId
+		let vCurrentCount = index.count
 		ioQueue.async { [weak self] in
-			let vCache = IndexStore.load(from: vUrl)
+			guard let vCache = IndexStore.load(from: vUrl) else { return }
 			// short-circuit when the on-disk content matches what we already
 			// have - common when the daemon resaves on a noise-only FSEvents
-			// burst (e.g. spotlight reindexing, temp files in /var)
-			if let vC = vCache, vC.lastEventId == vCurrentEventId {
-				return
-			}
-			let vLookup = AppModel.buildPathLookup(inRecords: vCache?.records ?? [])
+			// burst (e.g. spotlight reindexing, temp files in /var). The
+			// count check lets partial saves of a first scan through (the
+			// daemon keeps the event id at 0 until the scan completes).
+			if vCache.lastEventId == vCurrentEventId && vCache.records.count == vCurrentCount { return }
+			let vState = IndexState(inRecords: vCache.records)
 			DispatchQueue.main.async {
-				guard let vCache = vCache else { return }
-				self?.allRecords = vCache.records
-				self?.pathIndex = vLookup
-				self?.indexedCount = vCache.records.count
-				self?.lastEventId = vCache.lastEventId
+				guard let vSelf = self, !vSelf.isIndexer else { return }
+				vSelf.lastEventId = vCache.lastEventId
+				vSelf.replaceIndex(inState: vState)
 			}
 		}
 	}
@@ -583,59 +695,29 @@ final class AppModel: ObservableObject {
 	// MARK: Internals
 	// ===========================
 
-	// installs a freshly-built index and starts watching for changes. The
-	// per-window WindowSearchModel(s) observe allRecords and will refilter
-	// themselves; no need to fire a filter pass from here.
-	private func applyFreshIndex(inRecords: [FileRecord],
-								  inLookup: [String: Int],
-								  inEventId: UInt64) {
-		allRecords = inRecords
-		pathIndex = inLookup
-		indexedCount = inRecords.count
+	// installs a whole new index (cache load, reindex, reload, reconcile)
+	private func replaceIndex(inState: IndexState) {
+		index = inState
+		indexGeneration &+= 1
+		publishRecords()
+	}
+
+	// notifies observers that the records changed
+	private func publishRecords() {
+		if indexedCount != index.count {
+			indexedCount = index.count
+		}
+		recordsChanged.send()
+	}
+
+	// installs a freshly-built index and starts watching for changes
+	private func applyFreshIndex(inState: IndexState, inEventId: UInt64) {
+		replaceIndex(inState: inState)
 		lastEventId = inEventId
 		isIndexing = false
 		dirty = false
 		if isIndexer {
 			startWatching(inSinceWhen: inEventId)
-		}
-	}
-
-	// builds a fresh path -> array-index dictionary for the given records.
-	// nonisolated so any background queue can call it without an actor hop.
-	private nonisolated static func buildPathLookup(inRecords: [FileRecord]) -> [String: Int] {
-		var vMap: [String: Int] = [:]
-		vMap.reserveCapacity(inRecords.count)
-		for (vI, vRecord) in inRecords.enumerated() {
-			vMap[vRecord.fullPath] = vI
-		}
-		return vMap
-	}
-
-	// sorts the provided slice in place. nonisolated so the detached filter
-	// task can call it without an actor hop. Called by WindowSearchModel.
-	nonisolated static func sortInPlace(inRecords: inout [FileRecord],
-										 inDescriptor: FileSortDescriptor) {
-		switch inDescriptor {
-			case .nameAscending:
-				inRecords.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-			case .nameDescending:
-				inRecords.sort { $0.name.localizedStandardCompare($1.name) == .orderedDescending }
-			case .sizeAscending:
-				inRecords.sort { $0.size < $1.size }
-			case .sizeDescending:
-				inRecords.sort { $0.size > $1.size }
-			case .createdAscending:
-				inRecords.sort { $0.dateCreated < $1.dateCreated }
-			case .createdDescending:
-				inRecords.sort { $0.dateCreated > $1.dateCreated }
-			case .modifiedAscending:
-				inRecords.sort { $0.dateModified < $1.dateModified }
-			case .modifiedDescending:
-				inRecords.sort { $0.dateModified > $1.dateModified }
-			case .pathAscending:
-				inRecords.sort { $0.parentPath < $1.parentPath }
-			case .pathDescending:
-				inRecords.sort { $0.parentPath > $1.parentPath }
 		}
 	}
 }

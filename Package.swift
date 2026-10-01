@@ -27,6 +27,15 @@ let package = Package(
 			swiftSettings: [
 				.swiftLanguageMode(.v5)
 			]
+		),
+		// unit tests for the search syntax, index rules and cache format
+		.testTarget(
+			name: "AllofitTests",
+			dependencies: ["Allofit"],
+			path: "tests",
+			swiftSettings: [
+				.swiftLanguageMode(.v5)
+			]
 		)
 	]
 )

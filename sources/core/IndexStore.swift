@@ -189,10 +189,17 @@ enum IndexStore {
 		var vP = 0
 		guard let vLastEventId = readU64(from: vPayload, offset: &vP) else { return nil }
 		guard let vCount = readU64(from: vPayload, offset: &vP) else { return nil }
+		// each record takes at least 41 bytes - rejects a corrupt count
+		// before it turns into a huge reserveCapacity
+		guard vCount <= UInt64(vPayload.count / 41) else { return nil }
 		var vRecords: [FileRecord] = []
 		vRecords.reserveCapacity(Int(vCount))
+		// siblings share one parentPath buffer instead of one copy each
+		let vInterner = PathInterner()
 		for _ in 0..<Int(vCount) {
-			guard let vId = readU64(from: vPayload, offset: &vP),
+			// the stored id is ignored: ids are recomputed from the path so
+			// caches written with the old per-launch random hash still load
+			guard let _ = readU64(from: vPayload, offset: &vP),
 				  let vSize = readI64(from: vPayload, offset: &vP),
 				  let vCreated = readF64(from: vPayload, offset: &vP),
 				  let vModified = readF64(from: vPayload, offset: &vP),
@@ -203,9 +210,8 @@ enum IndexStore {
 				return nil
 			}
 			vRecords.append(FileRecord(
-				id: vId,
 				name: vName,
-				parentPath: vParent,
+				parentPath: vInterner.intern(vParent),
 				size: vSize,
 				dateCreated: Date(timeIntervalSince1970: vCreated),
 				dateModified: Date(timeIntervalSince1970: vModified),
@@ -280,8 +286,10 @@ enum IndexStore {
 		guard offset + vLength <= inData.count else { return nil }
 		let vStart = inData.startIndex + offset
 		let vEnd = vStart + vLength
-		let vSlice = inData[vStart..<vEnd]
 		offset += vLength
-		return String(data: vSlice, encoding: .utf8)
+		// native decode (no Foundation bridging); invalid bytes are repaired
+		return inData.withUnsafeBytes { vPtr in
+			String(decoding: vPtr[(vStart - inData.startIndex)..<(vEnd - inData.startIndex)], as: UTF8.self)
+		}
 	}
 }

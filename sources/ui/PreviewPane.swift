@@ -75,7 +75,6 @@ struct AuthorizeBadge: View {
 // closed) triggers the sudo-elevation flow.
 struct PreviewPane: View {
 
-	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var access: AccessManager
 	@EnvironmentObject var searchModel: WindowSearchModel
 	// passed in from ContentView (its @State) so this view re-renders

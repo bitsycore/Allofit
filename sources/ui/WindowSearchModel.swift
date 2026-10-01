@@ -10,14 +10,14 @@ import Combine
 // sorts against the same shared index.
 //
 // AppModel remains the single source of truth for allRecords. We subscribe
-// to it via Combine and rebuild the visible slice on a debounced background
-// task whenever any input changes.
+// to its recordsChanged signal and rebuild the visible slice on a debounced
+// background task whenever any input changes.
 @MainActor
 final class WindowSearchModel: ObservableObject {
 
 	// the user-entered search query; refilter is debounced via scheduleFilter
 	@Published var query: String = "" {
-		didSet { scheduleFilter() }
+		didSet { scheduleFilter(inDelay: kTypingDebounceSeconds) }
 	}
 	// the sort descriptor chosen by clicking a column header. Per-window:
 	// clicking the Size header in window A no longer re-sorts window B.
@@ -26,87 +26,149 @@ final class WindowSearchModel: ObservableObject {
 	@Published var sortDescriptor: FileSortDescriptor {
 		didSet {
 			Preferences.shared.lastSort = sortDescriptor
-			scheduleFilter()
+			scheduleFilter(inDelay: kTypingDebounceSeconds)
 		}
 	}
 	// the filtered, sorted and capped records currently shown in the table
 	@Published private(set) var visibleRecords: [FileRecord] = []
+	// total number of records matching the query (may exceed visibleRecords)
+	@Published private(set) var matchCount: Int = 0
 
 	// strong ref to the shared index; the per-window WindowSearchModel does
 	// not outlive its window, so the shared model has a longer lifetime
 	private let model: AppModel
-	// Combine subscription to AppModel's @Published allRecords
+	// Combine subscription to AppModel's recordsChanged signal
 	private var cancellables: Set<AnyCancellable> = []
 	// pending filter+sort task, cancelled if a newer one supersedes it
 	private var filterTask: Task<Void, Never>?
 
 	// maximum rows handed to SwiftUI Table for snappy scrolling
 	private let kMaxVisibleRows = 2000
-	// debounce delay between keystroke / index update and filter rebuild
-	private let kSearchDebounceSeconds: Double = 0.5
+	// delay after a keystroke / sort click: just enough to merge key repeats
+	private let kTypingDebounceSeconds: Double = 0.04
+	// delay after an index change: merges bursts of FSEvents updates
+	private let kIndexDebounceSeconds: Double = 0.3
+	// records per parallel filter chunk
+	private nonisolated static let kChunkSize = 16_384
 
 	init(model inModel: AppModel) {
 		self.model = inModel
 		self.sortDescriptor = Preferences.shared.lastSort
-		// Re-filter when the shared index changes. @Published fires the
-		// current value on subscribe; dropFirst skips that replay and we
-		// run one explicit scheduleFilter() below so the initial debounce
-		// delay applies consistently.
-		inModel.$allRecords
-			.dropFirst()
-			.receive(on: DispatchQueue.main)
-			.sink { [weak self] _ in
-				self?.scheduleFilter()
+		// Re-filter when the shared index changes. The signal carries no
+		// payload (the array itself is read when the filter runs), so a
+		// burst of updates never queues up copies of the index.
+		inModel.recordsChanged
+			.sink { [weak self] in
+				self?.scheduleFilter(inDelay: self?.kIndexDebounceSeconds ?? 0.3)
 			}
 			.store(in: &cancellables)
-		scheduleFilter()
+		scheduleFilter(inDelay: 0)
 	}
 
 	// debounces filter rebuilds so we don't refilter on every keystroke
-	// or every FSEvents batch mutation of AppModel.allRecords. The same
-	// debounce window covers all input changes, which is what the old
-	// single-model code did before this split.
-	private func scheduleFilter() {
+	// or every FSEvents batch. The latest call wins: earlier pending
+	// tasks are cancelled before they start (or between chunks).
+	private func scheduleFilter(inDelay: Double) {
 		filterTask?.cancel()
 		// snapshot inputs on main; the detached task is self-contained
 		let vQuery = query
 		let vSort = sortDescriptor
 		let vRecords = model.allRecords
 		let vMax = kMaxVisibleRows
-		let vDelayNanos = UInt64(kSearchDebounceSeconds * 1_000_000_000)
+		let vDelayNanos = UInt64(inDelay * 1_000_000_000)
 		filterTask = Task.detached(priority: .userInitiated) { [weak self] in
-			try? await Task.sleep(nanoseconds: vDelayNanos)
+			if vDelayNanos > 0 {
+				try? await Task.sleep(nanoseconds: vDelayNanos)
+			}
 			if Task.isCancelled { return }
 			let vEngine = SearchEngine(inQuery: vQuery)
-			var vFiltered: [FileRecord]
-			if vEngine.isActive {
-				vFiltered = vRecords.filter { vEngine.match(inRecord: $0) }
-			} else {
-				vFiltered = vRecords
+			// the chunks run on GCD worker threads, which can't see this
+			// task's cancellation - relay it through a shared flag
+			let vCancelled = ManagedAtomicFlag()
+			let vResult = await withTaskCancellationHandler {
+				WindowSearchModel.matchingPositions(
+					inRecords: vRecords,
+					inEngine: vEngine,
+					inCancelled: vCancelled
+				)
+			} onCancel: {
+				vCancelled.set()
 			}
+			guard let vPositions = vResult else { return }
 			if Task.isCancelled { return }
-			AppModel.sortInPlace(inRecords: &vFiltered, inDescriptor: vSort)
+			let vTop = ResultSorter.top(
+				inRecords: vRecords,
+				inPositions: vPositions,
+				inLimit: vMax,
+				inDescriptor: vSort
+			)
 			if Task.isCancelled { return }
-			let vCapped: [FileRecord]
-			if vFiltered.count > vMax {
-				vCapped = Array(vFiltered.prefix(vMax))
-			} else {
-				vCapped = vFiltered
-			}
-			if Task.isCancelled { return }
+			let vCount = vPositions.count
 			// hop back to main with DispatchQueue.main.async (rather than
 			// await MainActor.run) so the assignment is guaranteed to land
 			// on the next runloop tick, avoiding NSTableView reentrance when
 			// the search field is mid-edit
 			DispatchQueue.main.async {
 				guard let vSelf = self else { return }
-				// Skip the @Published fire when the resulting list is byte-
-				// for-byte identical to what the Table is already showing.
-				// Full FileRecord equality catches mtime / size updates, so
-				// we only skip true no-op reassignments.
-				if vSelf.visibleRecords == vCapped { return }
-				vSelf.visibleRecords = vCapped
+				if vSelf.matchCount != vCount { vSelf.matchCount = vCount }
+				// Skip the @Published fire when the resulting list is
+				// identical to what the Table is already showing. Full
+				// FileRecord equality catches mtime / size updates, so we
+				// only skip true no-op reassignments.
+				if vSelf.visibleRecords == vTop { return }
+				vSelf.visibleRecords = vTop
 			}
 		}
+	}
+
+	// positions of the records matching the engine, computed in parallel
+	// chunks. Returns nil if the task was cancelled midway.
+	private nonisolated static func matchingPositions(inRecords: [FileRecord],
+													  inEngine: SearchEngine,
+													  inCancelled: ManagedAtomicFlag) -> [Int32]? {
+		if !inEngine.isActive {
+			return (0..<Int32(inRecords.count)).map { $0 }
+		}
+		let vChunkCount = (inRecords.count + kChunkSize - 1) / kChunkSize
+		if vChunkCount == 0 { return [] }
+		var vChunks = [[Int32]](repeating: [], count: vChunkCount)
+		vChunks.withUnsafeMutableBufferPointer { vOut in
+			// each chunk writes only its own slot, so sharing is safe
+			nonisolated(unsafe) let vOutBase = vOut.baseAddress!
+			DispatchQueue.concurrentPerform(iterations: vChunkCount) { vChunk in
+				if inCancelled.isSet { return }
+				let vStart = vChunk * kChunkSize
+				let vEnd = min(vStart + kChunkSize, inRecords.count)
+				var vLocal: [Int32] = []
+				for vI in vStart..<vEnd where inEngine.match(inRecord: inRecords[vI]) {
+					vLocal.append(Int32(vI))
+				}
+				(vOutBase + vChunk).pointee = vLocal
+			}
+		}
+		if inCancelled.isSet { return nil }
+		return Array(vChunks.joined())
+	}
+}
+
+// Minimal thread-safe boolean used to stop parallel filter chunks early.
+private final class ManagedAtomicFlag: @unchecked Sendable {
+	// current value
+	private var value = false
+	// guards value
+	private let lock = NSLock()
+
+	// true once set() has been called
+	var isSet: Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		return value
+	}
+
+	// raises the flag
+	func set() {
+		lock.lock()
+		value = true
+		lock.unlock()
 	}
 }
