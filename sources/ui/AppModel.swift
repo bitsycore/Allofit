@@ -143,6 +143,16 @@ final class AppModel: ObservableObject {
 	private var watchedRoots: Set<String> = []
 	// exclusions the running watcher resolves changes with
 	private var currentExclusions: ExclusionMatcher?
+	// subtree walks started but not merged yet
+	private var rescansInFlight = 0
+	// event id to save while rescans are in flight: the id from before the
+	// changes that triggered them, so a quit or crash mid-walk replays those
+	// changes instead of losing the folders' contents for good
+	private var rescanFloorEventId: UInt64?
+	// a reader-mode reload skipped (throttled or no window visible)
+	private var pendingReaderReload = false
+	// service mode the current role was started with (see activeServiceMode)
+	private(set) var bootMode: Preferences.ServiceMode = .none
 	// bumped whenever the whole index is replaced, so a subtree rescan that
 	// started against the previous index doesn't merge into the new one
 	private var indexGeneration = 0
@@ -224,6 +234,18 @@ final class AppModel: ObservableObject {
 		.store(in: &cancellables)
 	}
 
+	// the service mode actually in effect: the saved mode, but only if that
+	// service is really installed. A mode saved without a working install
+	// (or a service removed behind the app's back) falls back to indexing
+	// in-process instead of waiting forever on a cache nobody writes.
+	var activeServiceMode: Preferences.ServiceMode {
+		switch prefs.serviceMode {
+			case .none: return .none
+			case .userAgent: return ServiceInstaller.isInstalled(inScope: .userAgent) ? .userAgent : .none
+			case .rootDaemon: return ServiceInstaller.isInstalled(inScope: .rootDaemon) ? .rootDaemon : .none
+		}
+	}
+
 	// kicks off background activity for the first time. Subsequent calls are
 	// no-ops so we don't double-bootstrap when the user reopens the window.
 	// To force a re-bootstrap (e.g. after Install/Uninstall swaps the role),
@@ -261,7 +283,12 @@ final class AppModel: ObservableObject {
 	private func bootstrap() {
 		tearDownActiveMode()
 
-		if prefs.serviceMode != .none {
+		let vMode = activeServiceMode
+		bootMode = vMode
+		if vMode != prefs.serviceMode {
+			NSLog("[Allofit GUI] service mode %@ saved but not installed, indexing in-process", prefs.serviceMode.rawValue)
+		}
+		if vMode != .none {
 			isIndexer = false
 		} else {
 			let vLock = IndexerLock(path: IndexStore.lockURL(forSystem: false).path)
@@ -275,12 +302,12 @@ final class AppModel: ObservableObject {
 		}
 
 		isLoadingCache = true
-		let vCacheURL = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
+		let vCacheURL = IndexStore.cacheURL(forServiceMode: vMode)
 		let vIsIndexer = isIndexer
 		let vRoots = Set(VolumeManager.effectiveRoots(inPreferences: prefs).map { $0.path })
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		NSLog("[Allofit GUI] bootstrap: serviceMode=%@ isIndexer=%@ cacheURL=%@",
-			  prefs.serviceMode.rawValue,
+			  vMode.rawValue,
 			  vIsIndexer ? "true" : "false",
 			  vCacheURL.path)
 		ioQueue.async { [weak self] in
@@ -331,26 +358,44 @@ final class AppModel: ObservableObject {
 		let vRoots = VolumeManager.effectiveRoots(inPreferences: prefs)
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		let vStartId = UInt64(FSEventsGetCurrentEventId())
+		let vIoQueue = ioQueue
+		// partial results only when there is nothing to show yet (first
+		// run): a manual rebuild keeps the old index visible until the end
+		let vPublishPartial = index.count == 0
 		indexQueue.async { [weak self] in
 			var vAccumulated: [FileRecord] = []
+			// the results fill in while the walk runs (instead of an empty
+			// window until the end of a scan that can take minutes)
+			let kPartialPublishSeconds: TimeInterval = 3
+			var vLastPublish = Date()
 			for vRoot in vRoots {
 				// per-root autoreleasepool so the file-enumeration's
 				// autoreleased NSURL/NSDate/NSNumber objects don't pile
 				// up across roots inside this long-running async block
 				autoreleasepool {
-					let vBaseline = vAccumulated.count
-					let vList = FileIndexer.indexRoot(inRoot: vRoot, inExclusions: vMatcher) { vCount in
+					FileIndexer.walkRoot(inRoot: vRoot, inExclusions: vMatcher) { vBatch in
+						vAccumulated.append(contentsOf: vBatch)
+						let vCount = vAccumulated.count
+						let vNow = Date()
+						guard vPublishPartial, vNow.timeIntervalSince(vLastPublish) >= kPartialPublishSeconds else {
+							DispatchQueue.main.async { self?.indexedCount = vCount }
+							return
+						}
+						vLastPublish = vNow
+						let vPartial = IndexState(inRecords: vAccumulated)
 						DispatchQueue.main.async {
-							self?.indexedCount = vBaseline + vCount
+							guard let vSelf = self, vSelf.isIndexing else { return }
+							vSelf.replaceIndex(inState: vPartial)
 						}
 					}
-					vAccumulated.append(contentsOf: vList)
 				}
 			}
 			let vState = IndexState(inRecords: vAccumulated)
-			// persist off-main before bouncing back so main never sees the
-			// LZ4 compression cost
-			IndexStore.save(inRecords: vState.records, inLastEventId: vStartId)
+			// persist off-main (on the save queue, so it never races another
+			// save) before bouncing back: main never sees the LZ4 cost
+			vIoQueue.sync {
+				IndexStore.save(inRecords: vState.records, inLastEventId: vStartId)
+			}
 			DispatchQueue.main.async {
 				self?.applyFreshIndex(inState: vState, inEventId: vStartId)
 			}
@@ -379,7 +424,7 @@ final class AppModel: ObservableObject {
 	// the daemon would re-write it on its next autosave, so we tunnel the
 	// delete through the same stop/delete/start admin script.
 	func performClearCache() async {
-		switch prefs.serviceMode {
+		switch activeServiceMode {
 			case .none:
 				IndexStore.clearCache(at: IndexStore.cacheURL(forServiceMode: .none))
 				workMessage = "Cache cleared."
@@ -394,11 +439,14 @@ final class AppModel: ObservableObject {
 	// installs a launchd service for the current serviceMode preference,
 	// off-main so the password dialog doesn't freeze the GUI. On success
 	// the GUI hot-swaps into reader mode so the user doesn't need to relaunch.
-	func performInstallService() async {
-		let vOk = await runPrivilegedAction(inLabel: "Installing service") { vScope, _ in
+	// inMode is the mode chosen in Settings: it is only saved once the
+	// install succeeded, so a failed or cancelled install changes nothing
+	func performInstallService(inMode: Preferences.ServiceMode) async {
+		let vOk = await runPrivilegedAction(inLabel: "Installing service", inMode: inMode) { vScope, _ in
 			try ServiceInstaller.install(inScope: vScope)
 		}
 		if vOk {
+			prefs.serviceMode = inMode
 			// give launchd a moment to bring the daemon up before we switch
 			// the GUI into reader mode and start watching the cache file
 			try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -409,8 +457,8 @@ final class AppModel: ObservableObject {
 	// stops the running daemon for the current serviceMode preference
 	// without uninstalling. Plist stays on disk so the next launch (or
 	// performStartService) brings it back.
-	func performStopService() async {
-		await runPrivilegedAction(inLabel: "Stopping service") { vScope, _ in
+	func performStopService(inMode: Preferences.ServiceMode? = nil) async {
+		await runPrivilegedAction(inLabel: "Stopping service", inMode: inMode) { vScope, _ in
 			try ServiceInstaller.stop(inScope: vScope)
 		}
 	}
@@ -418,8 +466,8 @@ final class AppModel: ObservableObject {
 	// starts a stopped-but-installed daemon for the current serviceMode
 	// preference. Hot-swaps the GUI into reader mode on success so the
 	// reader watcher picks up the daemon's first cache write.
-	func performStartService() async {
-		let vOk = await runPrivilegedAction(inLabel: "Starting service") { vScope, _ in
+	func performStartService(inMode: Preferences.ServiceMode? = nil) async {
+		let vOk = await runPrivilegedAction(inLabel: "Starting service", inMode: inMode) { vScope, _ in
 			try ServiceInstaller.start(inScope: vScope)
 		}
 		if vOk {
@@ -430,11 +478,16 @@ final class AppModel: ObservableObject {
 
 	// uninstalls the launchd service for the current serviceMode preference.
 	// On success the GUI hot-swaps back into built-in indexer mode.
-	func performUninstallService() async {
-		let vOk = await runPrivilegedAction(inLabel: "Uninstalling service") { vScope, _ in
+	func performUninstallService(inMode: Preferences.ServiceMode? = nil) async {
+		let vMode = inMode ?? prefs.serviceMode
+		let vOk = await runPrivilegedAction(inLabel: "Uninstalling service", inMode: vMode) { vScope, _ in
 			try ServiceInstaller.uninstall(inScope: vScope)
 		}
 		if vOk {
+			// back to the built-in indexer when the active service went away
+			if vMode == prefs.serviceMode {
+				prefs.serviceMode = .none
+			}
 			// give launchd a moment to actually tear the daemon down so its
 			// indexer lock is released before the GUI tries to grab it
 			try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -446,9 +499,11 @@ final class AppModel: ObservableObject {
 	// publishing isWorking/workMessage so the ui can show progress. Returns
 	// true if the action ran without throwing.
 	@discardableResult
+	// inMode defaults to the saved mode (the installed service)
 	private func runPrivilegedAction(inLabel: String,
+									  inMode: Preferences.ServiceMode? = nil,
 									  inBody: @Sendable @escaping (ServiceInstaller.Scope, URL) throws -> Void) async -> Bool {
-		let vMode = prefs.serviceMode
+		let vMode = inMode ?? prefs.serviceMode
 		guard vMode != .none else { return false }
 		let vScope: ServiceInstaller.Scope = (vMode == .userAgent) ? .userAgent : .rootDaemon
 		let vUrl = IndexStore.cacheURL(forServiceMode: vMode)
@@ -474,13 +529,15 @@ final class AppModel: ObservableObject {
 
 	// writes the current index to disk (autosave, window close, replay end).
 	// Snapshots on main (cheap COW), compresses off-main.
-	func saveCache() {
-		guard isIndexer else { return }
+	// inForce saves even when nothing changed (to persist replay progress)
+	func saveCache(inForce: Bool = false) {
+		guard isIndexer, dirty || inForce else { return }
 		let vRecords = index.records
 		// lastEventId tracks what is actually merged into the index; the
 		// stream's latest id can be ahead (changes still being resolved),
-		// and saving that would make the next launch skip those changes
-		let vEventId = lastEventId
+		// and saving that would make the next launch skip those changes.
+		// While subtree walks are pending, the id from before them is kept.
+		let vEventId = rescanFloorEventId ?? lastEventId
 		dirty = false
 		ioQueue.async {
 			IndexStore.save(inRecords: vRecords, inLastEventId: vEventId)
@@ -492,7 +549,7 @@ final class AppModel: ObservableObject {
 	private func saveCacheNow() {
 		guard isIndexer, dirty else { return }
 		let vRecords = index.records
-		let vEventId = lastEventId
+		let vEventId = rescanFloorEventId ?? lastEventId
 		dirty = false
 		ioQueue.sync {
 			IndexStore.save(inRecords: vRecords, inLastEventId: vEventId)
@@ -523,14 +580,15 @@ final class AppModel: ObservableObject {
 				  lastEventId, vCurrentId)
 			lastEventId = vCurrentId
 			startWatching(inSinceWhen: vCurrentId)
-			kickRescanSubtrees(inPaths: vRoots)
+			// floor 0: an interrupted walk makes the next launch start over
+			kickRescanSubtrees(inPaths: vRoots, inFloorEventId: 0)
 			return
 		}
 		startWatching(inSinceWhen: lastEventId)
 		// roots added since the cache was written have never been walked
 		let vMissing = vRoots.filter { !index.contains(inPath: $0) }
 		if !vMissing.isEmpty {
-			kickRescanSubtrees(inPaths: vMissing)
+			kickRescanSubtrees(inPaths: vMissing, inFloorEventId: lastEventId)
 		}
 	}
 
@@ -577,6 +635,11 @@ final class AppModel: ObservableObject {
 	// collapse into one check. When the app becomes more visible (or a
 	// delay is shortened), pending changes are applied right away.
 	private func activityChanged(inLevel: AppActivity.Level) {
+		// reader mode: a reload skipped while hidden happens now
+		if inLevel != .hidden && pendingReaderReload && !isIndexer {
+			pendingReaderReload = false
+			reloadFromCache()
+		}
 		let vDelay: TimeInterval
 		switch inLevel {
 			case .foreground: vDelay = prefs.updateDelayForeground
@@ -610,6 +673,7 @@ final class AppModel: ObservableObject {
 	// in-memory work; the stats were done off-main by IndexState.resolve)
 	private func applyResolvedChanges(inResolved: ResolvedChanges) {
 		guard isIndexer else { return }
+		let vEventIdBefore = lastEventId
 		let vResult = index.apply(inChanges: inResolved, inRoots: watchedRoots)
 		lastEventId = max(lastEventId, inResolved.maxEventId)
 		if vResult.changed {
@@ -617,24 +681,32 @@ final class AppModel: ObservableObject {
 			publishRecords()
 		}
 		if !vResult.rescans.isEmpty {
-			kickRescanSubtrees(inPaths: vResult.rescans)
+			kickRescanSubtrees(inPaths: vResult.rescans, inFloorEventId: vEventIdBefore)
+		}
+		if !vResult.newFolders.isEmpty {
+			kickRescanSubtrees(inPaths: vResult.newFolders, inFloorEventId: vEventIdBefore, inNewFolders: true)
 		}
 		// persist right after a relaunch replay finishes so the next launch
 		// resumes from here instead of replaying the same history again
 		if inResolved.historyDone {
 			NSLog("[Allofit GUI] FSEvents history replay done, saving cache")
-			saveCache()
+			saveCache(inForce: true)
 		}
 	}
 
 	// re-walks the given subtrees in the background, then swaps their
 	// content in on main. Used for kernel-requested rescans, folders that
 	// were moved/renamed into the tree, and newly added roots.
-	private func kickRescanSubtrees(inPaths: [String]) {
+	// inFloorEventId is saved instead of lastEventId until the walk is
+	// merged. inNewFolders: the folders just appeared, so their records are
+	// merged without the O(n) removal pass of a kernel-requested rescan.
+	private func kickRescanSubtrees(inPaths: [String], inFloorEventId: UInt64, inNewFolders: Bool = false) {
 		let vRoots = SubtreeMatcher.minimalRoots(inPaths: inPaths)
 		guard !vRoots.isEmpty else { return }
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		let vGeneration = indexGeneration
+		rescanFloorEventId = min(rescanFloorEventId ?? inFloorEventId, inFloorEventId)
+		rescansInFlight += 1
 		indexQueue.async { [weak self] in
 			var vRecords: [FileRecord] = []
 			for vPath in vRoots {
@@ -649,8 +721,18 @@ final class AppModel: ObservableObject {
 			}
 			let vFinal = vRecords
 			DispatchQueue.main.async {
-				guard let vSelf = self, vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
-				vSelf.index.replaceSubtrees(inRoots: vRoots, inRecords: vFinal)
+				guard let vSelf = self else { return }
+				vSelf.rescansInFlight -= 1
+				if vSelf.rescansInFlight <= 0 {
+					vSelf.rescansInFlight = 0
+					vSelf.rescanFloorEventId = nil
+				}
+				guard vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
+				if inNewFolders {
+					vSelf.index.mergeNewFolders(inRecords: vFinal)
+				} else {
+					vSelf.index.replaceSubtrees(inRoots: vRoots, inRecords: vFinal)
+				}
 				vSelf.dirty = true
 				vSelf.publishRecords()
 			}
@@ -668,6 +750,10 @@ final class AppModel: ObservableObject {
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		let vState = index
 		let vGeneration = indexGeneration
+		// replay point: changes merged after this snapshot (and those whose
+		// subtree walks are still running) would be lost when the pruned
+		// copy replaces the live index, so the watcher restarts from here
+		let vSnapshotEventId = rescanFloorEventId ?? lastEventId
 		watcher.stop()
 		indexQueue.async { [weak self] in
 			var vPruned = vState
@@ -677,11 +763,38 @@ final class AppModel: ObservableObject {
 				NSLog("[Allofit GUI] reconcile: %d records pruned", vRemoved)
 				vSelf.replaceIndex(inState: vPruned)
 				vSelf.dirty = true
-				vSelf.startWatching(inSinceWhen: vSelf.lastEventId)
+				vSelf.lastEventId = vSnapshotEventId
+				vSelf.startWatching(inSinceWhen: vSnapshotEventId)
 				let vMissing = vRoots.filter { !vSelf.index.contains(inPath: $0) }
 				if !vMissing.isEmpty {
-					vSelf.kickRescanSubtrees(inPaths: vMissing)
+					vSelf.kickRescanSubtrees(inPaths: vMissing, inFloorEventId: vSnapshotEventId)
 				}
+			}
+		}
+	}
+
+	// drops paths (and what's below them) from the index right away. Used
+	// after Move to Trash from Allofit: the watcher ignores this process's
+	// own file operations, so FSEvents would never report the removal
+	func forget(inPaths: [String]) {
+		guard isIndexer, !inPaths.isEmpty else { return }
+		if index.removeSubtrees(inPaths: inPaths) > 0 {
+			dirty = true
+			publishRecords()
+		}
+	}
+
+	// (re)adds paths this app created or moved back itself (undo of Move to
+	// Trash), which FSEvents doesn't report to it. Resolved like FSEvents
+	// changes, so restored folders get walked too.
+	func notice(inPaths: [String]) {
+		guard isIndexer, !inPaths.isEmpty else { return }
+		let vChanges = inPaths.map { FSChange(path: $0, flags: 0, eventId: 0) }
+		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
+		indexQueue.async { [weak self] in
+			let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: vMatcher)
+			DispatchQueue.main.async {
+				self?.applyResolvedChanges(inResolved: vResolved)
 			}
 		}
 	}
@@ -692,7 +805,7 @@ final class AppModel: ObservableObject {
 
 	// follows the cache written by another indexer (service or second instance)
 	private func startReaderMode() {
-		let vUrl = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
+		let vUrl = IndexStore.cacheURL(forServiceMode: bootMode)
 		let vDir = vUrl.deletingLastPathComponent().path
 		let vTarget = vUrl.path
 		NSLog("[Allofit GUI] reader mode: watching cache at %@", vTarget)
@@ -744,12 +857,30 @@ final class AppModel: ObservableObject {
 	//      we don't need to re-render the whole list at FSEvents' rate -
 	//      the next tick will catch any newer state.
 	private func reloadFromCache() {
-		let vNow = Date()
-		if let vLast = lastReloadAt, vNow.timeIntervalSince(vLast) < kMinReloadInterval {
+		guard !isIndexer else { return }
+		// nobody looks: reload once a window shows up again
+		if AppActivity.shared.level == .hidden {
+			pendingReaderReload = true
 			return
 		}
+		let vNow = Date()
+		if let vLast = lastReloadAt, vNow.timeIntervalSince(vLast) < kMinReloadInterval {
+			// throttled: catch up when the interval ends instead of
+			// dropping the change (the mtime poll has already seen it)
+			if !pendingReaderReload {
+				pendingReaderReload = true
+				let vWait = kMinReloadInterval - vNow.timeIntervalSince(vLast)
+				DispatchQueue.main.asyncAfter(deadline: .now() + vWait) { [weak self] in
+					guard let vSelf = self, vSelf.pendingReaderReload else { return }
+					vSelf.pendingReaderReload = false
+					vSelf.reloadFromCache()
+				}
+			}
+			return
+		}
+		pendingReaderReload = false
 		lastReloadAt = vNow
-		let vUrl = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
+		let vUrl = IndexStore.cacheURL(forServiceMode: bootMode)
 		let vCurrentEventId = lastEventId
 		let vCurrentCount = index.count
 		ioQueue.async { [weak self] in

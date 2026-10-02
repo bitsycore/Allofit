@@ -136,6 +136,19 @@ enum FileIndexer {
 		if inSkipHidden && (vValues.isHidden ?? false) {
 			return nil
 		}
+		// live updates only: on a case-insensitive volume a case-only
+		// rename (Foo -> foo) still resolves the old spelling, which would
+		// leave a ghost "Foo" entry. If the name stored on disk differs from
+		// the reported path by case only, the reported path is gone.
+		if inSkipHidden, let vStored = try? vUrl.resourceValues(forKeys: [.nameKey]).name {
+			let vReported = inURL.lastPathComponent
+			// .nameKey shows a ":" in an HFS name as "/"; compare composed forms
+			let vOnDisk = vStored.replacingOccurrences(of: "/", with: ":").precomposedStringWithCanonicalMapping
+			let vAsReported = vReported.precomposedStringWithCanonicalMapping
+			if vOnDisk != vAsReported && vOnDisk.lowercased() == vAsReported.lowercased() {
+				return nil
+			}
+		}
 		// name/parent come from the path (not .nameKey) so that
 		// parentPath + "/" + name always round-trips to the watched path,
 		// which is what the id and the parent-is-indexed rule rely on

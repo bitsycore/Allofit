@@ -257,6 +257,9 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		return [
 			"~/Library/Caches",
 			"~/Library/Containers",
+			// other apps' shared data: reading it triggers macOS 15's
+			// "access data from other apps" prompt
+			"~/Library/Group Containers",
 			"~/.Trash",
 			"/private/var/folders"
 		].map { ($0 as NSString).expandingTildeInPath }

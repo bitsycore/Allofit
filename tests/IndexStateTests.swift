@@ -89,7 +89,8 @@ struct IndexStateTests {
 		]
 		let vResult = vState.apply(inChanges: vChanges, inRoots: ["/r"])
 		#expect(vResult.changed)
-		#expect(vResult.rescans == ["/r/moved"])
+		#expect(vResult.newFolders == ["/r/moved"])
+		#expect(vResult.rescans.isEmpty)
 		#expect(vState.contains(inPath: "/r/a/new.txt"))
 		#expect(!vState.contains(inPath: "/r/hidden/x.txt"))
 		#expect(vState.contains(inPath: "/r/moved/inside.txt"))
@@ -102,7 +103,45 @@ struct IndexStateTests {
 		vChanges.upserts = [Self.dir("/r/renamed")]
 		let vResult = vState.apply(inChanges: vChanges, inRoots: ["/r"])
 		#expect(!vState.contains(inPath: "/r/a/b/2.txt"))
-		#expect(vResult.rescans == ["/r/renamed"])
+		#expect(vResult.newFolders == ["/r/renamed"])
+	}
+
+	@Test func newFolderInsideKernelRescanIsWalkedOnce() {
+		var vState = Self.sampleState()
+		var vChanges = ResolvedChanges()
+		vChanges.upserts = [Self.dir("/r/a/fresh")]
+		vChanges.rescans = ["/r/a"]
+		let vResult = vState.apply(inChanges: vChanges, inRoots: ["/r"])
+		#expect(vResult.rescans == ["/r/a"])
+		#expect(vResult.newFolders.isEmpty)
+		// merging a new folder's walk only upserts (no removal pass)
+		vState.mergeNewFolders(inRecords: [Self.dir("/r/a/fresh"), Self.file("/r/a/fresh/x.txt")])
+		#expect(vState.contains(inPath: "/r/a/fresh/x.txt"))
+		#expect(vState.contains(inPath: "/r/a/b/2.txt"))
+	}
+
+	@Test func fullSortMatchesComparatorForNumericKeys() {
+		let vRecords = (0..<3000).map { Self.file("/r/f\($0)", size: Int64(($0 * 7919) % 97)) }
+		let vPositions = (0..<Int32(vRecords.count)).map { $0 }
+		for vSort in [FileSortDescriptor.sizeAscending, .sizeDescending] {
+			let vFull = ResultSorter.topPositions(inRecords: vRecords, inPositions: vPositions, inLimit: vRecords.count, inDescriptor: vSort)
+			let vHeap = ResultSorter.topPositions(inRecords: vRecords, inPositions: vPositions, inLimit: 100, inDescriptor: vSort)
+			#expect(Array(vFull.prefix(100)) == vHeap, "sort \(vSort.rawValue)")
+		}
+	}
+
+	@Test func caseOnlyRenameDropsTheOldSpelling() throws {
+		let vDir = FileManager.default.temporaryDirectory.appendingPathComponent("allofit-case-\(UUID().uuidString)")
+		try FileManager.default.createDirectory(at: vDir, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: vDir) }
+		let vOld = vDir.appendingPathComponent("Report.txt")
+		let vNew = vDir.appendingPathComponent("report.txt")
+		try Data("x".utf8).write(to: vOld)
+		try FileManager.default.moveItem(at: vOld, to: vNew)
+		// the old spelling still opens on a case-insensitive volume, but must
+		// not be re-added as a separate entry
+		#expect(FileIndexer.makeRecord(inURL: vOld, inSkipHidden: true) == nil)
+		#expect(FileIndexer.makeRecord(inURL: vNew, inSkipHidden: true)?.name == "report.txt")
 	}
 
 	@Test func unchangedUpsertIsNotAChange() {

@@ -5,6 +5,9 @@ import AppKit
 // listens and re-grabs first responder, mimicking the standard Find shortcut.
 extension Notification.Name {
 	static let allofitFocusSearch = Notification.Name("AllofitFocusSearch")
+	// posted by the search field (object: its window) when ↓ is pressed:
+	// that window's results list takes the keyboard focus
+	static let allofitFocusResults = Notification.Name("AllofitFocusResults")
 }
 
 // SearchField wraps AppKit's NSSearchField so we get native macOS behaviors
@@ -202,11 +205,18 @@ struct SearchField: NSViewRepresentable {
 					 textView inTextView: NSTextView,
 					 doCommandBy inSelector: Selector) -> Bool {
 			guard let vField = inControl as? NSSearchField else { return false }
-			if inSelector == #selector(NSResponder.moveUp(_:)) {
+			// ↓ goes to the results (like Everything); history moves to
+			// ↑ / ⌥↑ (older) and ⌥↓ (newer)
+			if inSelector == #selector(NSResponder.moveDown(_:)) {
+				NotificationCenter.default.post(name: .allofitFocusResults, object: vField.window)
+				return true
+			}
+			if inSelector == #selector(NSResponder.moveUp(_:))
+				|| inSelector == #selector(NSResponder.moveToBeginningOfParagraph(_:)) {
 				navigateHistory(field: vField, inOlder: true)
 				return true
 			}
-			if inSelector == #selector(NSResponder.moveDown(_:)) {
+			if inSelector == #selector(NSResponder.moveToEndOfParagraph(_:)) {
 				navigateHistory(field: vField, inOlder: false)
 				return true
 			}

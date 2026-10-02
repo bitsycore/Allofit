@@ -62,7 +62,8 @@ jobs:
             | tee "Allofit-${{ steps.version.outputs.version }}.sha256"
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        # pinned to a commit: this step holds a write token for the repo
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Allofit ${{ steps.version.outputs.version }}

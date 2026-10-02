@@ -37,11 +37,29 @@ All notable changes to Allofit are documented here.
 - **High CPU use with a path search open.** An open window searching with a `/` term re-ran the whole search on every file change and could keep several CPU cores busy. Path searches are also about three times faster.
 - **Dragging files into a browser** opened the file in place of the web page instead of uploading it. Dragged rows now carry real files, like Finder.
 - **Roots under `/tmp`, `/var` or `/etc`** never matched their own entries.
+- **Files moved to the Trash from Allofit** came back in the results a moment later; they now leave the index, and ⌘Z puts them back.
+- **Interrupted rescans** (quit or crash while a folder was being re-read) could lose that folder's contents until the next full rebuild.
+- **Changing roots or exclusions** could drop file changes made at the same moment.
+- **Renaming a file by case only** (`Foo` → `foo`) left a ghost entry.
+- **Picking a service mode in Settings** took effect before Install, which could leave the app waiting for a service that didn't exist; the mode is now saved only when Install succeeds, and a missing service falls back to the built-in indexer.
 - **Long names and paths:** hovering a cut-off name or path for half a second shows the full text over the cell, and it stays while you hover, even when the list refreshes.
+
+### Security
+
+- The "Authorize Access" copy no longer lets root change the owner or permissions of a path the user controls (it could be redirected to take over a system file).
+- The background service no longer logs to fixed file names in `/tmp`; logs go to `/Library/Logs/Allofit/` (system service) or `~/Library/Logs/Allofit/` (user service).
+- The system service's index, which lists every file name it can see, is readable only by root and the user who installed the service (it was readable by every account). Your own index is now private to you too.
+- Installing the system service no longer copies a plist from a temporary file a user process could swap, and always uses the real app binary.
+- Corrupt or oversized cache files are rejected instead of being expanded in memory, and two saves can no longer overwrite each other's temporary file.
+- The release workflow pins its publishing action to an exact commit, and the app binary no longer searches the Xcode folder for libraries.
 
 ### Changed
 
 - **Much less background work:** file changes are batched longer and open results refresh less often while Allofit isn't focused, and the status bar stops sampling when no window is visible.
+- **Faster:** sorting a large list by date or size is about 10× faster, selecting rows no longer scans every result, new folders are merged without a pass over the whole index, and the background service saves at most every 15 s instead of every 3 s.
+- **First launch:** results appear while the index is being built, an empty list explains why (loading, indexing, no match, filter on), and the macOS privacy prompts explain what Allofit reads.
+- **Keyboard:** ↓ moves from the search field to the results and ↑ on the first row comes back; search history moved to ↑ / ⌥↑ / ⌥↓. The right-click menu shows the shortcuts.
+- **Help:** a ? button and Help > Search Syntax show the query syntax. Clear Cache and Uninstall ask for confirmation, and Move to Trash reports failures.
 - **Lower memory use:** the index is stored in chunks, so search results take 4 bytes per row and a file change copies only a small part of the index.
 - **Settings** are regrouped into four tabs: General, Indexes (folders, exclusions, volumes), Performance and Advanced (service, cache, diagnostics).
 - **Rebuild Index** moved from ⌘R to ⇧⌘R, so it's harder to trigger by accident.

@@ -34,7 +34,15 @@ enum ResultSorter {
 		}
 
 		if inPositions.count <= inLimit {
-			return inPositions.sorted(by: vBefore)
+			switch inDescriptor {
+				case .nameAscending, .nameDescending, .pathAscending, .pathDescending:
+					// string keys: comparing in place is as fast or faster
+					// (moving tuples of strings during the sort costs more)
+					return inPositions.sorted(by: vBefore)
+				default:
+					// numeric keys: ~10x faster sorted as a compact key array
+					return sortedByKey(inRecords: inRecords, inPositions: inPositions, inDescriptor: inDescriptor)
+			}
 		}
 
 		// max-heap (worst candidate on top) of the best inLimit seen so far
@@ -61,6 +69,35 @@ enum ResultSorter {
 			siftDown(0)
 		}
 		return vHeap.sorted(by: vBefore)
+	}
+
+	// complete sort by size or date. Each record's key is read once into a
+	// compact array, which is then sorted: comparing through the records
+	// copies two whole FileRecords (with their strings' retain / release)
+	// per comparison - 539 ms vs 47 ms for 630k entries by date. Ties are
+	// broken by id, matching the top-N path.
+	private static func sortedByKey<C: RandomAccessCollection>(inRecords: C,
+															   inPositions: [Int32],
+															   inDescriptor: FileSortDescriptor) -> [Int32]
+	where C.Index == Int, C.Element == FileRecord {
+		let vDescending = inDescriptor == .sizeDescending
+			|| inDescriptor == .createdDescending
+			|| inDescriptor == .modifiedDescending
+		var vKeys = inPositions.map { vPos -> (Double, UInt64, Int32) in
+			let vRecord = inRecords[Int(vPos)]
+			let vKey: Double
+			switch inDescriptor {
+				case .sizeAscending, .sizeDescending: vKey = Double(vRecord.size)
+				case .createdAscending, .createdDescending: vKey = vRecord.dateCreated.timeIntervalSinceReferenceDate
+				default: vKey = vRecord.dateModified.timeIntervalSinceReferenceDate
+			}
+			return (vKey, vRecord.id, vPos)
+		}
+		vKeys.sort { vA, vB in
+			if vA.0 != vB.0 { return vDescending ? vA.0 > vB.0 : vA.0 < vB.0 }
+			return vA.1 < vB.1
+		}
+		return vKeys.map(\.2)
 	}
 
 	// primary ordering for each sort mode. Names compare on the folded form

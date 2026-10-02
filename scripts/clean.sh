@@ -23,8 +23,11 @@ kSystemDaemonPlist="/Library/LaunchDaemons/${kServicePlistName}"
 kUserCacheDir="$HOME/Library/Application Support/Allofit"
 kSystemCacheDir="/Library/Application Support/Allofit"
 kUserPrefsPlist="$HOME/Library/Preferences/${kBundleId}.plist"
+# old /tmp log names (versions up to 1.0.9) and the current log folders
 kServiceLogStdout="/tmp/allofit-service.log"
 kServiceLogStderr="/tmp/allofit-service.err"
+kUserLogDir="$HOME/Library/Logs/Allofit"
+kSystemLogDir="/Library/Logs/Allofit"
 
 # ==================
 # MARK: Args
@@ -168,6 +171,15 @@ if [[ -f "$kServiceLogStdout" || -f "$kServiceLogStderr" ]]; then
 			fi
 		fi
 	done
+fi
+if [[ -d "$kUserLogDir" ]]; then
+	echo "==> Removing user service logs"
+	vRun rm -rf "$kUserLogDir"
+fi
+if [[ -d "$kSystemLogDir" ]]; then
+	echo "==> Removing system service logs (needs sudo)"
+	vNeedsSudo
+	vRun sudo rm -rf "$kSystemLogDir"
 fi
 
 # ==================

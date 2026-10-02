@@ -103,6 +103,14 @@ echo "==> Assembling ${kAppName}.app"
 rm -rf "${vAppBundle}"
 mkdir -p "${vMacOSDir}" "${vResourcesDir}"
 cp "${vBinarySrc}" "${vMacOSDir}/${kAppName}"
+
+# drop library search paths that point outside the system (the toolchain
+# embeds one into /Applications/Xcode.app): the same binary runs as the root
+# daemon, which must never look for libraries in an admin-writable folder
+while read -r vRpath; do
+	[[ -z "${vRpath}" ]] && continue
+	install_name_tool -delete_rpath "${vRpath}" "${vMacOSDir}/${kAppName}"
+done < <(otool -l "${vMacOSDir}/${kAppName}" | awk '/cmd LC_RPATH/{getline; getline; print $2}' | grep -v '^/usr/lib' || true)
 chmod +x "${vMacOSDir}/${kAppName}"
 
 # ==================
@@ -211,6 +219,17 @@ ${vIconPlistEntry}
 	<false/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
+	<!-- text shown in the macOS privacy prompts triggered by the first scan -->
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Allofit indexes file names on your Desktop so they show up in searches. File contents are never read.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Allofit indexes file names in Documents so they show up in searches. File contents are never read.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Allofit indexes file names in Downloads so they show up in searches. File contents are never read.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Allofit indexes file names on external drives you choose to include in searches.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Allofit indexes file names on network volumes you choose to include in searches.</string>
 	<!-- Finder > right-click a folder > Services / Quick Actions > Search in Allofit -->
 	<key>NSServices</key>
 	<array>

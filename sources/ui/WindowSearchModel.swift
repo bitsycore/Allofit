@@ -120,12 +120,14 @@ final class WindowSearchModel: ObservableObject {
 		}
 	}
 
-	// drops rows right away (e.g. after Move to Trash); the index catches up
-	// through FSEvents a moment later
-	func removeVisible(inIds: Set<FileRecord.ID>) {
-		results = results.removing(inIds: inIds)
+	// drops trashed records: their rows at once, and from the shared index
+	// (FSEvents doesn't report this process's own file operations)
+	func removeTrashed(inRecords: [FileRecord]) {
+		let vIds = Set(inRecords.map(\.id))
+		results = results.removing(inIds: vIds)
 		resultsVersion &+= 1
 		stats.matchCount = results.count
+		model.forget(inPaths: inRecords.map(\.fullPath))
 	}
 
 	// publishes a result list (and its count / highlights) on main
@@ -143,6 +145,11 @@ final class WindowSearchModel: ObservableObject {
 		}
 		results = inResults
 		resultsVersion &+= 1
+	}
+
+	// files put back from the Trash (undo): adds them to the index again
+	func noticeRestored(inPaths: [String]) {
+		model.notice(inPaths: inPaths)
 	}
 
 	// throttled reaction to an index change: nothing while off screen,

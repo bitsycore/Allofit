@@ -31,44 +31,6 @@ struct QuickLookPreviewView: NSViewRepresentable {
 	}
 }
 
-// AuthorizeBadge is the small lock icon that appears at the right of the
-// selected row when the preview pane is closed. Clicking it kicks off the
-// sudo cp + chown via AdminShell - the system prompts for the password
-// the first time inside the admin-auth-cache window.
-//
-// access is taken as an @ObservedObject property (not @EnvironmentObject)
-// because this view is hosted inside a SwiftUI Table cell, and Table cell
-// content is rendered in its own NSHostingView. That hosting view does
-// not reliably inherit the parent's environment objects; a missing
-// access lookup triggers EnvironmentObject.error() → SIGTRAP. Passing
-// the AccessManager explicitly sidesteps that entire failure mode.
-struct AuthorizeBadge: View {
-
-	@ObservedObject var access: AccessManager
-	let record: FileRecord
-
-	var body: some View {
-		Button {
-			Task { await access.authorize(record) }
-		} label: {
-			if access.isAuthorizing(record.id) {
-				ProgressView()
-					.controlSize(.small)
-					.frame(width: 16, height: 16)
-			} else {
-				Image(systemName: "lock.shield.fill")
-					.foregroundStyle(.orange)
-					.font(.system(size: 14, weight: .semibold))
-			}
-		}
-		.buttonStyle(.plain)
-		.disabled(access.isAuthorizing(record.id))
-		.help(access.isAuthorizing(record.id)
-			  ? "Authorizing…"
-			  : "Authorize to read this file")
-	}
-}
-
 // PreviewPane is the right-hand side panel in the main window. When
 // exactly one row is selected it renders a Quick Look preview plus a
 // small metadata footer. If the file isn't user-readable the preview
@@ -81,11 +43,11 @@ struct PreviewPane: View {
 	@EnvironmentObject var searchModel: WindowSearchModel
 	// passed in from ContentView (its @State) so this view re-renders
 	// whenever the user's selection changes
-	let selection: Set<FileRecord.ID>
+	let selection: [FileRecord]
 
+	// the record to preview: only with exactly one selected
 	private var selectedRecord: FileRecord? {
-		guard selection.count == 1, let vId = selection.first else { return nil }
-		return searchModel.results.first(where: { $0.id == vId })
+		return selection.count == 1 ? selection.first : nil
 	}
 
 	var body: some View {

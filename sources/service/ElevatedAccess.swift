@@ -54,6 +54,9 @@ enum ElevatedAccess {
 			withIntermediateDirectories: true,
 			attributes: [.posixPermissions: 0o700]
 		)
+		// creation attributes don't apply to an existing folder: enforce
+		// owner-only access every time (the copies may be other users' files)
+		chmod(vDir.path, 0o700)
 
 		// unique destination file, keeping the original extension so the
 		// QLPreviewView / Launch Services can pick the right renderer
@@ -63,12 +66,16 @@ enum ElevatedAccess {
 			vDst.appendPathExtension(vExt)
 		}
 
-		// cp + chown to the current user. The chmod restores plain user
-		// rw / group+other r so the file is treated normally by QL etc.
+		// Root only *reads* the original; the copy is written by the user
+		// (sudo -u ... tee), so root never creates, chowns or chmods a path
+		// inside a user-writable folder. A cp + chown + chmod as root could
+		// be redirected through a swapped-in symlink / hard link to take
+		// ownership of any system file. pipefail makes a failed read fail
+		// the script instead of leaving an empty copy behind.
 		let vScript = """
-		cp \(AdminShell.quote(inUrl.path)) \(AdminShell.quote(vDst.path)) && \
-		chown \(AdminShell.quote(NSUserName())) \(AdminShell.quote(vDst.path)) && \
-		chmod 0644 \(AdminShell.quote(vDst.path))
+		set -o pipefail; \
+		/bin/cat \(AdminShell.quote(inUrl.path)) \
+		| /usr/bin/sudo -u \(AdminShell.quote(NSUserName())) /usr/bin/tee \(AdminShell.quote(vDst.path)) > /dev/null
 		"""
 		_ = try AdminShell.run(vScript)
 		return vDst

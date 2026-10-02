@@ -35,7 +35,7 @@ Same syntax as Everything:
 | `"some/folder/**/path" IMG_????.heic` | path wildcards: `*` stays inside one folder name, `**` spans any number of folders (zero too) |
 | `photos/**/` | a trailing `/` means anything inside that folder |
 
-The list shows the first 2,000 results in the chosen order; the status bar shows the total count.
+Every match is listed, in the order of the column you click; the filter menu next to the search box narrows to one kind of item, and the ? button shows this syntax in the app. Hidden files and folders (dot-files, `~/Library` when hidden) are not indexed.
 
 ## Shortcuts
 
@@ -57,9 +57,9 @@ Hovering a cut-off name or path for half a second shows it in full. In Finder, r
 
 ## Background service (optional)
 
-**Settings → Service** installs a LaunchAgent (user) or LaunchDaemon (root) that keeps the index updated even when the app is closed.
+**Settings → Advanced → Service** installs a LaunchAgent (user) or LaunchDaemon (root) that keeps the index updated even when the app is closed. The chosen mode only takes effect once Install succeeds. Service logs go to `~/Library/Logs/Allofit/` (user) or `/Library/Logs/Allofit/` (root).
 
-Root daemon mode needs **Full Disk Access** granted to its binary in **System Settings → Privacy & Security**, otherwise it won't see new files in `~/Documents`, `~/Desktop`, `~/Downloads`. The Diagnostics tab shows the exact path to add.
+Root daemon mode needs **Full Disk Access** granted to its binary in **System Settings → Privacy & Security**, otherwise it won't see new files in `~/Documents`, `~/Desktop`, `~/Downloads`. **Settings → Advanced → Diagnostics** shows the exact path to add. The root daemon's index is readable only by root and the user who installed it.
 
 ## Build from source
 

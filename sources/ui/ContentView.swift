@@ -15,11 +15,16 @@ struct ContentView: View {
 	// per-window search model: owns this window's query + results so two
 	// windows can run independent searches against the shared AppModel
 	@EnvironmentObject var searchModel: WindowSearchModel
-	// selected record ids (shared with the table, preview and status bar)
-	@State private var selection: Set<FileRecord.ID> = []
+	// selected records, in row order (shared with the table, preview and
+	// status bar)
+	@State private var selection: [FileRecord] = []
+	// window undo stack (Move to Trash can be undone)
+	@Environment(\.undoManager) private var undoManager
 	// whether the right-hand preview pane is currently visible. Persisted
 	// across launches so the user's pane-visibility preference sticks.
 	@AppStorage("Allofit.showPreviewPane") private var showPreviewPane: Bool = true
+	// search syntax popover
+	@State private var showSyntaxHelp = false
 
 	var body: some View {
 		Group {
@@ -40,17 +45,19 @@ struct ContentView: View {
 				Button {
 					showPreviewPane.toggle()
 				} label: {
-					Image(systemName: showPreviewPane
-						  ? "sidebar.right"
-						  : "sidebar.squares.right")
+					// a real label so VoiceOver reads it, shown as an icon
+					Label(showPreviewPane ? "Hide Preview" : "Show Preview",
+						  systemImage: showPreviewPane ? "sidebar.right" : "sidebar.squares.right")
+						.labelStyle(.iconOnly)
 				}
 				.help(showPreviewPane ? "Hide preview" : "Show preview")
 			}
 			ToolbarItem(placement: .primaryAction) {
 				SettingsLink {
-					Image(systemName: "gearshape")
+					Label("Settings", systemImage: "gearshape")
+						.labelStyle(.iconOnly)
 				}
-				.help("Preferences (⌘,)")
+				.help("Settings (⌘,)")
 			}
 		}
 	}
@@ -89,6 +96,18 @@ struct ContentView: View {
 			.pickerStyle(.menu)
 			.fixedSize()
 			.help("Show only one kind of item")
+			// search syntax cheat sheet
+			Button {
+				showSyntaxHelp.toggle()
+			} label: {
+				Label("Search Syntax", systemImage: "questionmark.circle")
+					.labelStyle(.iconOnly)
+			}
+			.buttonStyle(.borderless)
+			.help("Search syntax")
+			.popover(isPresented: $showSyntaxHelp, arrowEdge: .bottom) {
+				SyntaxHelpView()
+			}
 		}
 		.padding(.horizontal, 12)
 		.padding(.vertical, 8)
@@ -109,16 +128,20 @@ struct ContentView: View {
 			selection: $selection,
 			sort: $searchModel.sortDescriptor,
 			needsAuthorization: { vRecord in access.needsAuthorization(for: vRecord) },
-			perform: { vAction, vIds in perform(inAction: vAction, inIds: vIds) }
+			perform: { vAction, vRecords in perform(inAction: vAction, inRecords: vRecords) }
 		)
+		// explains an empty list (loading, indexing, no match, filter on)
+		.overlay {
+			EmptyResultsView(stats: searchModel.stats, filter: searchModel.filter, hasQuery: !searchModel.query.isEmpty)
+				.allowsHitTesting(false)
+		}
 	}
 
 	// "3 selected (12 MB)" for the status bar, nil without a selection
 	private var selectionSummary: String? {
 		guard !selection.isEmpty else { return nil }
-		let vRecords = recordsFor(inIds: selection)
-		let vBytes = vRecords.filter { !$0.isDirectory }.reduce(Int64(0)) { $0 + $1.size }
-		let vCount = "\(vRecords.count.formatted()) selected"
+		let vBytes = selection.filter { !$0.isDirectory }.reduce(Int64(0)) { $0 + $1.size }
+		let vCount = "\(selection.count.formatted()) selected"
 		return vBytes > 0 ? "\(vCount) (\(Formatters.size(bytes: vBytes)))" : vCount
 	}
 
@@ -127,100 +150,108 @@ struct ContentView: View {
 	// ===========================
 
 	// runs an action requested by the table (menu, keyboard, double-click)
-	private func perform(inAction: ResultAction, inIds: Set<FileRecord.ID>) {
+	private func perform(inAction: ResultAction, inRecords: [FileRecord]) {
 		switch inAction {
 			case .primary:
 				switch prefs.primaryAction {
-					case .open: openSelection(inIds: inIds)
-					case .reveal: revealSelection(inIds: inIds)
+					case .open: openRecords(inRecords)
+					case .reveal: revealRecords(inRecords)
 				}
-			case .open: openSelection(inIds: inIds)
-			case .openWith(let vApp): openSelection(inIds: inIds, withApp: vApp)
-			case .reveal: revealSelection(inIds: inIds)
-			case .quickLook: quickLookSelection(inIds: inIds)
-			case .copyFiles: copyFiles(inIds: inIds)
-			case .copyNames: copyNames(inIds: inIds)
-			case .copyPaths: copyPaths(inIds: inIds)
-			case .trash: trashSelection(inIds: inIds)
+			case .open: openRecords(inRecords)
+			case .openWith(let vApp): openRecords(inRecords, withApp: vApp)
+			case .reveal: revealRecords(inRecords)
+			case .quickLook:
+				// prefer the staged URL when one exists - QLPreviewPanel
+				// renders it without permission issues
+				QuickLookCoordinator.shared.show(inUrls: inRecords.map { access.effectiveURL(for: $0) })
+			case .copyFiles:
+				NSPasteboard.general.clearContents()
+				NSPasteboard.general.writeObjects(inRecords.map { URL(fileURLWithPath: $0.fullPath) as NSURL })
+			case .copyNames:
+				copyLines(inRecords.map(\.name))
+			case .copyPaths:
+				// always the original path - a staged copy's tmp path means
+				// nothing outside this session
+				copyLines(inRecords.map(\.fullPath))
+			case .trash:
+				trashRecords(inRecords)
 			case .authorize:
-				if let vRecord = recordsFor(inIds: inIds).first {
+				if let vRecord = inRecords.first {
 					Task { await access.authorize(vRecord) }
 				}
 		}
 	}
 
-	// reveals the selected files in Finder
-	private func revealSelection(inIds: Set<FileRecord.ID>) {
-		// reveal in Finder shows the *original* file (not the staged copy),
-		// since the user wants to navigate to the real location on disk
-		let vUrls = recordsFor(inIds: inIds).map { URL(fileURLWithPath: $0.fullPath) }
-		NSWorkspace.shared.activateFileViewerSelecting(vUrls)
+	// reveals the records in Finder (the original files, not staged copies)
+	private func revealRecords(_ inRecords: [FileRecord]) {
+		NSWorkspace.shared.activateFileViewerSelecting(inRecords.map { URL(fileURLWithPath: $0.fullPath) })
 	}
 
-	// opens the selected files in the Quick Look panel
-	private func quickLookSelection(inIds: Set<FileRecord.ID>) {
-		// prefer the staged URL when one exists - QLPreviewPanel renders
-		// it without permission issues, whereas the original would fail
-		let vUrls = recordsFor(inIds: inIds).map { access.effectiveURL(for: $0) }
-		QuickLookCoordinator.shared.show(inUrls: vUrls)
-	}
-
-	// copies the selected paths, one per line
-	private func copyPaths(inIds: Set<FileRecord.ID>) {
-		// always copy the original path - the staged tmp path is an
-		// implementation detail that has no meaning outside this session
-		let vPaths = recordsFor(inIds: inIds).map { $0.fullPath }
+	// puts one string per line on the pasteboard
+	private func copyLines(_ inLines: [String]) {
 		NSPasteboard.general.clearContents()
-		NSPasteboard.general.setString(vPaths.joined(separator: "\n"), forType: .string)
+		NSPasteboard.general.setString(inLines.joined(separator: "\n"), forType: .string)
 	}
 
-	// copies the selected files themselves (paste in Finder copies them)
-	private func copyFiles(inIds: Set<FileRecord.ID>) {
-		let vUrls = recordsFor(inIds: inIds).map { URL(fileURLWithPath: $0.fullPath) as NSURL }
-		NSPasteboard.general.clearContents()
-		NSPasteboard.general.writeObjects(vUrls)
-	}
-
-	// copies the selected names, one per line
-	private func copyNames(inIds: Set<FileRecord.ID>) {
-		let vNames = recordsFor(inIds: inIds).map { $0.name }
-		NSPasteboard.general.clearContents()
-		NSPasteboard.general.setString(vNames.joined(separator: "\n"), forType: .string)
-	}
-
-	// moves the selected files to the Trash and drops their rows at once
-	private func trashSelection(inIds: Set<FileRecord.ID>) {
-		let vRecords = recordsFor(inIds: inIds)
-		let vUrls = vRecords.map { URL(fileURLWithPath: $0.fullPath) }
-		NSWorkspace.shared.recycle(vUrls) { vTrashed, _ in
-			let vGone = Set(vRecords.filter { vTrashed[URL(fileURLWithPath: $0.fullPath)] != nil }.map(\.id))
-			guard !vGone.isEmpty else { return }
+	// moves the records to the Trash: their rows go away at once, ⌘Z puts
+	// them back, and a failure is reported instead of silently ignored
+	private func trashRecords(_ inRecords: [FileRecord]) {
+		let vUrls = inRecords.map { URL(fileURLWithPath: $0.fullPath) }
+		let vUndo = undoManager
+		NSWorkspace.shared.recycle(vUrls) { vTrashed, vError in
+			// look the results up with the very URL objects passed in (a
+			// folder's URL gains a trailing slash, rebuilt ones wouldn't match)
+			var vMoved: [(record: FileRecord, original: URL, trashed: URL)] = []
+			for (vRecord, vUrl) in zip(inRecords, vUrls) {
+				if let vInTrash = vTrashed[vUrl] {
+					vMoved.append((vRecord, vUrl, vInTrash))
+				}
+			}
 			DispatchQueue.main.async {
-				searchModel.removeVisible(inIds: vGone)
-				selection.subtract(vGone)
+				if !vMoved.isEmpty {
+					searchModel.removeTrashed(inRecords: vMoved.map(\.record))
+					let vGone = Set(vMoved.map(\.record.id))
+					selection.removeAll { vGone.contains($0.id) }
+					registerPutBack(inMoves: vMoved.map { ($0.original, $0.trashed) }, inUndo: vUndo)
+				}
+				if let vError = vError {
+					let vAlert = NSAlert(error: vError)
+					vAlert.messageText = vMoved.isEmpty
+						? "Couldn't move to the Trash"
+						: "Some items couldn't be moved to the Trash"
+					vAlert.runModal()
+				}
 			}
 		}
 	}
 
-	// opens the selected files with a specific app
-	private func openSelection(inIds: Set<FileRecord.ID>, withApp inApp: URL) {
-		let vUrls = recordsFor(inIds: inIds).map { access.effectiveURL(for: $0) }
+	// registers "Undo Move to Trash": moves the items back and tells the
+	// index (the watcher ignores this app's own file operations)
+	private func registerPutBack(inMoves: [(original: URL, trashed: URL)], inUndo: UndoManager?) {
+		guard let vUndo = inUndo else { return }
+		let vModel = searchModel
+		vUndo.registerUndo(withTarget: vModel) { vTarget in
+			var vRestored: [String] = []
+			for vMove in inMoves where (try? FileManager.default.moveItem(at: vMove.trashed, to: vMove.original)) != nil {
+				vRestored.append(vMove.original.path)
+			}
+			vTarget.noticeRestored(inPaths: vRestored)
+		}
+		vUndo.setActionName(inMoves.count == 1 ? "Move to Trash" : "Move \(inMoves.count) Items to Trash")
+	}
+
+	// opens the records with a specific app
+	private func openRecords(_ inRecords: [FileRecord], withApp inApp: URL) {
+		let vUrls = inRecords.map { access.effectiveURL(for: $0) }
 		NSWorkspace.shared.open(vUrls, withApplicationAt: inApp, configuration: NSWorkspace.OpenConfiguration())
 	}
 
-	// opens the selected files with their default app
-	private func openSelection(inIds: Set<FileRecord.ID>) {
-		// open the staged copy when available so the default app can read
-		// it; falls back to the original path for files we can read directly
-		for vRecord in recordsFor(inIds: inIds) {
+	// opens the records with their default app (the staged copy when one
+	// exists, so the app can read it)
+	private func openRecords(_ inRecords: [FileRecord]) {
+		for vRecord in inRecords {
 			NSWorkspace.shared.open(access.effectiveURL(for: vRecord))
 		}
-	}
-
-	// shown records with the given ids
-	private func recordsFor(inIds: Set<FileRecord.ID>) -> [FileRecord] {
-		guard !inIds.isEmpty else { return [] }
-		return searchModel.results.filter { inIds.contains($0.id) }
 	}
 }
 
@@ -293,7 +324,8 @@ private struct StatusBarView: View {
 
 	// "N results · M indexed"
 	private var resultsText: String {
-		return "\(stats.matchCount.formatted()) results  ·  \(model.indexedCount.formatted()) indexed"
+		let vCount = stats.matchCount
+		return "\(vCount.formatted()) \(vCount == 1 ? "result" : "results")  ·  \(model.indexedCount.formatted()) indexed"
 	}
 
 	// indexer / reader role, plus the service kind when one is used
@@ -319,5 +351,59 @@ private struct StatusBarView: View {
 			"Roots: \(prefs.rootPaths.count)  ·  Role: \(roleText)"
 		]
 		return vLines.joined(separator: "\n")
+	}
+}
+
+// ===========================
+// MARK: Empty state
+// ===========================
+
+// EmptyResultsView is shown over an empty results list and says why it's
+// empty: the index is loading or being built, nothing matches, or a filter
+// hides everything. It observes AppModel itself so ContentView doesn't have to.
+private struct EmptyResultsView: View {
+
+	@EnvironmentObject var model: AppModel
+	// match count of this window
+	@ObservedObject var stats: SearchStats
+	// active category filter
+	let filter: SearchFilter
+	// true when something is typed in the search field
+	let hasQuery: Bool
+
+	var body: some View {
+		if stats.matchCount == 0 {
+			VStack(spacing: 8) {
+				if model.isLoadingCache {
+					ProgressView()
+					Text("Loading the index…")
+						.font(.headline)
+				} else if model.isIndexing {
+					ProgressView()
+					Text("Building the index…")
+						.font(.headline)
+					Text("\(model.indexedCount.formatted()) files so far. Results appear as they are found.")
+						.font(.callout)
+				} else if model.indexedCount == 0 {
+					Text("Nothing indexed yet")
+						.font(.headline)
+					Text("Add folders in Settings > Indexes.")
+						.font(.callout)
+				} else {
+					Text("No results")
+						.font(.headline)
+					if filter != .everything {
+						Text("Only \(filter.title.lowercased()) are shown. Choose Everything in the filter menu to search all items.")
+							.font(.callout)
+					} else if hasQuery {
+						Text("Click ? next to the search field for the search syntax.")
+							.font(.callout)
+					}
+				}
+			}
+			.foregroundColor(.secondary)
+			.multilineTextAlignment(.center)
+			.frame(maxWidth: 360)
+		}
 	}
 }

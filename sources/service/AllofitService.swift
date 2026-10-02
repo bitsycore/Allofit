@@ -127,8 +127,14 @@ enum AllofitService {
 				let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: vMatcher)
 				vState.lock.lock()
 				let vResult = vState.index.apply(inChanges: vResolved, inRoots: vRootSet)
-				vState.lastEventId = max(vState.lastEventId, vResolved.maxEventId)
 				if vResult.changed { vState.dirty = true }
+				// with no walk pending the batch is fully merged: advance the
+				// saved event id now; otherwise only once the walks are in,
+				// so a restart mid-walk replays the changes that caused them
+				let vHasWalks = !vResult.rescans.isEmpty || !vResult.newFolders.isEmpty
+				if !vHasWalks {
+					vState.lastEventId = max(vState.lastEventId, vResolved.maxEventId)
+				}
 				vState.lock.unlock()
 				if vResolved.historyDone {
 					NSLog("[Allofit] FSEvents history replay done")
@@ -136,22 +142,28 @@ enum AllofitService {
 					vState.dirty = true
 					vState.lock.unlock()
 				}
+				guard vHasWalks else { return }
 
-				// folders moved in, or history lost: walk them again
+				// history lost (kernel rescans): replace those subtrees
 				if !vResult.rescans.isEmpty {
 					NSLog("[Allofit] rescanning %d subtree(s)", vResult.rescans.count)
-					var vFresh: [FileRecord] = []
-					for vPath in vResult.rescans {
-						vFresh.append(contentsOf: FileIndexer.indexRoot(
-							inRoot: URL(fileURLWithPath: vPath),
-							inExclusions: vMatcher
-						))
-					}
+					let vFresh = walk(inPaths: vResult.rescans, inExclusions: vMatcher)
 					vState.lock.lock()
 					vState.index.replaceSubtrees(inRoots: vResult.rescans, inRecords: vFresh)
 					vState.dirty = true
 					vState.lock.unlock()
 				}
+				// folders that appeared (created, moved or renamed in)
+				if !vResult.newFolders.isEmpty {
+					let vFresh = walk(inPaths: vResult.newFolders, inExclusions: vMatcher)
+					vState.lock.lock()
+					vState.index.mergeNewFolders(inRecords: vFresh)
+					vState.dirty = true
+					vState.lock.unlock()
+				}
+				vState.lock.lock()
+				vState.lastEventId = max(vState.lastEventId, vResolved.maxEventId)
+				vState.lock.unlock()
 			}
 		}
 
@@ -160,8 +172,22 @@ enum AllofitService {
 		exit(0)
 	}
 
-	// periodic save loop (background thread). 3-second check interval so
-	// new files appear in the GUI within a few seconds of being created.
+	// walks the given subtrees, returning every indexable entry below them
+	private static func walk(inPaths: [String], inExclusions: ExclusionMatcher) -> [FileRecord] {
+		var vResult: [FileRecord] = []
+		for vPath in inPaths {
+			autoreleasepool {
+				vResult.append(contentsOf: FileIndexer.indexRoot(
+					inRoot: URL(fileURLWithPath: vPath),
+					inExclusions: inExclusions
+				))
+			}
+		}
+		return vResult
+	}
+
+	// periodic save loop (background thread): checks every 3 s and saves
+	// at most every 15 s, so new files reach the GUI within ~15 s.
 	// Every N saves we also compact the in-memory containers so Swift's
 	// Array/Dict capacity (which only grows on churn, never auto-shrinks)
 	// doesn't drift into multi-GB territory after a day of heavy file
@@ -176,9 +202,16 @@ enum AllofitService {
 	private static func startAutosaveLoop(inState: State) {
 		DispatchQueue.global(qos: .utility).async {
 			let kCompactEvery = 20
+			// minimum gap between two saves: a save writes the whole index
+			// (~25 MB for 600k entries) and makes the app reload all of it,
+			// so under constant file activity every 3 s was ~8 MB/s of disk
+			// writes plus over a second of CPU per cycle across both processes
+			let kMinSaveIntervalSeconds: TimeInterval = 15
 			var vSavesSinceCompact = 0
+			var vLastSaveAt = Date.distantPast
 			while true {
 				sleep(3)
+				if Date().timeIntervalSince(vLastSaveAt) < kMinSaveIntervalSeconds { continue }
 				autoreleasepool {
 					inState.lock.lock()
 					let vShouldSave = inState.dirty
@@ -190,6 +223,7 @@ enum AllofitService {
 					NSLog("[Allofit] autosaving %d records (RSS %.1f MB)",
 						  vSnapshot.count, processFootprintMB())
 					IndexStore.save(inRecords: vSnapshot, inLastEventId: vEventId)
+					vLastSaveAt = Date()
 					vSavesSinceCompact += 1
 					if vSavesSinceCompact >= kCompactEvery {
 						vSavesSinceCompact = 0

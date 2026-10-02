@@ -30,14 +30,15 @@ struct ResultsTable: NSViewRepresentable {
 	let highlights: SearchEngine.Highlights
 	// false to show plain text (Settings > General)
 	let highlightEnabled: Bool
-	// selected record ids
-	@Binding var selection: Set<FileRecord.ID>
+	// selected records, in row order (handed out directly so the window
+	// never has to look them up among hundreds of thousands of results)
+	@Binding var selection: [FileRecord]
 	// active sort, driven by header clicks
 	@Binding var sort: FileSortDescriptor
 	// true when the record isn't readable without authorization
 	let needsAuthorization: (FileRecord) -> Bool
 	// runs an action on records
-	let perform: (ResultAction, Set<FileRecord.ID>) -> Void
+	let perform: (ResultAction, [FileRecord]) -> Void
 
 	// column identifiers, also the autosave keys
 	static let kNameColumn = NSUserInterfaceItemIdentifier("name")
@@ -194,22 +195,36 @@ struct ResultsTable: NSViewRepresentable {
 				// the hovered cell instead of making it flicker away
 				(vTable as? ResultsNSTableView)?.refreshHover()
 				restoreSelection(inTable: vTable)
-			} else if selectedIds(inTable: vTable) != inParent.selection {
+			} else if selectedIds(inTable: vTable) != Set(inParent.selection.map(\.id)) {
 				restoreSelection(inTable: vTable)
 			}
 		}
 
-		// selects the rows whose ids are in the SwiftUI selection
+		// selects the rows of the SwiftUI selection in the (new) list. One
+		// pass over the rows, only with a selection; records that are gone
+		// (trashed, filtered out) are dropped from the selection so later
+		// updates don't keep searching for them
 		private func restoreSelection(inTable: NSTableView) {
-			let vWanted = parent.selection
+			let vWanted = Set(parent.selection.map(\.id))
 			var vRows = IndexSet()
 			if !vWanted.isEmpty {
-				for (vRow, vRecord) in records.enumerated() where vWanted.contains(vRecord.id) {
+				for vRow in 0..<records.count where vWanted.contains(records[vRow].id) {
 					vRows.insert(vRow)
 					if vRows.count == vWanted.count { break }
 				}
 			}
 			inTable.selectRowIndexes(vRows, byExtendingSelection: false)
+			let vFound = selectedRecords(inTable: inTable)
+			if vFound.count != parent.selection.count || vFound != parent.selection {
+				DispatchQueue.main.async { [weak self] in
+					self?.parent.selection = vFound
+				}
+			}
+		}
+
+		// selected rows' records, in row order (cost follows the selection)
+		private func selectedRecords(inTable: NSTableView) -> [FileRecord] {
+			return inTable.selectedRowIndexes.compactMap { $0 < records.count ? records[$0] : nil }
 		}
 
 		// ids of the rows selected in the table
@@ -221,17 +236,17 @@ struct ResultsTable: NSViewRepresentable {
 			return vIds
 		}
 
-		// selection as ids, for the actions
-		var currentSelection: Set<FileRecord.ID> {
+		// the selected records, for the actions
+		var currentSelection: [FileRecord] {
 			guard let vTable = table else { return [] }
-			return selectedIds(inTable: vTable)
+			return selectedRecords(inTable: vTable)
 		}
 
 		// runs an action on the current selection
 		func perform(_ inAction: ResultAction) {
-			let vIds = currentSelection
-			guard !vIds.isEmpty else { return }
-			parent.perform(inAction, vIds)
+			let vRecords = currentSelection
+			guard !vRecords.isEmpty else { return }
+			parent.perform(inAction, vRecords)
 		}
 
 		// ===========================
@@ -290,10 +305,10 @@ struct ResultsTable: NSViewRepresentable {
 		// selection changed in the table: publish the ids
 		func tableViewSelectionDidChange(_ inNotification: Notification) {
 			guard !isApplying, let vTable = table else { return }
-			let vIds = selectedIds(inTable: vTable)
+			let vRecords = selectedRecords(inTable: vTable)
 			DispatchQueue.main.async { [weak self] in
-				guard let vSelf = self, vSelf.parent.selection != vIds else { return }
-				vSelf.parent.selection = vIds
+				guard let vSelf = self, vSelf.parent.selection != vRecords else { return }
+				vSelf.parent.selection = vRecords
 			}
 		}
 
@@ -316,26 +331,26 @@ struct ResultsTable: NSViewRepresentable {
 			if vClicked >= 0, !vTable.selectedRowIndexes.contains(vClicked) {
 				vTable.selectRowIndexes(IndexSet(integer: vClicked), byExtendingSelection: false)
 			}
-			let vIds = currentSelection
-			guard !vIds.isEmpty else { return }
-			let vSelected = records.filter { vIds.contains($0.id) }
+			let vSelected = currentSelection
+			guard !vSelected.isEmpty else { return }
 
-			inMenu.addItem(ClosureMenuItem("Open") { [weak self] in self?.perform(.open) })
+			// key equivalents are shown as hints (the table handles the keys)
+			inMenu.addItem(ClosureMenuItem("Open") { [weak self] in self?.perform(.open) }.showingKey("\r", []))
 			if let vFirst = vSelected.first {
 				inMenu.addItem(openWithItem(for: vFirst))
 			}
-			inMenu.addItem(ClosureMenuItem("Reveal in Finder") { [weak self] in self?.perform(.reveal) })
-			inMenu.addItem(ClosureMenuItem("Quick Look") { [weak self] in self?.perform(.quickLook) })
+			inMenu.addItem(ClosureMenuItem("Reveal in Finder") { [weak self] in self?.perform(.reveal) }.showingKey("\r", [.command]))
+			inMenu.addItem(ClosureMenuItem("Quick Look") { [weak self] in self?.perform(.quickLook) }.showingKey("y", [.command]))
 			inMenu.addItem(.separator())
-			inMenu.addItem(ClosureMenuItem("Copy") { [weak self] in self?.perform(.copyFiles) })
+			inMenu.addItem(ClosureMenuItem("Copy") { [weak self] in self?.perform(.copyFiles) }.showingKey("c", [.command]))
 			inMenu.addItem(ClosureMenuItem("Copy Name") { [weak self] in self?.perform(.copyNames) })
-			inMenu.addItem(ClosureMenuItem("Copy Path") { [weak self] in self?.perform(.copyPaths) })
-			if vIds.count == 1, let vOnly = vSelected.first, parent.needsAuthorization(vOnly) {
+			inMenu.addItem(ClosureMenuItem("Copy Path") { [weak self] in self?.perform(.copyPaths) }.showingKey("c", [.command, .option]))
+			if vSelected.count == 1, let vOnly = vSelected.first, parent.needsAuthorization(vOnly) {
 				inMenu.addItem(.separator())
 				inMenu.addItem(ClosureMenuItem("Authorize Access…") { [weak self] in self?.perform(.authorize) })
 			}
 			inMenu.addItem(.separator())
-			inMenu.addItem(ClosureMenuItem("Move to Trash") { [weak self] in self?.perform(.trash) })
+			inMenu.addItem(ClosureMenuItem("Move to Trash") { [weak self] in self?.perform(.trash) }.showingKey("\u{8}", [.command]))
 		}
 
 		// "Open With" submenu: default app first, then the other candidates
@@ -442,6 +457,31 @@ final class ResultsNSTableView: NSTableView {
 		showHoverOverlay(inRow: vCurrent.row, inColumn: vCurrent.column)
 	}
 
+	// listens for ↓ in the search field of the same window
+	override func viewDidMoveToWindow() {
+		super.viewDidMoveToWindow()
+		NotificationCenter.default.removeObserver(self, name: .allofitFocusResults, object: nil)
+		if let vWindow = window {
+			NotificationCenter.default.addObserver(
+				self,
+				selector: #selector(focusFromSearchField(_:)),
+				name: .allofitFocusResults,
+				object: vWindow
+			)
+		}
+	}
+
+	// takes the focus from the search field and selects the first row
+	// when nothing is selected yet
+	@objc private func focusFromSearchField(_ inNotification: Notification) {
+		guard numberOfRows > 0 else { return }
+		window?.makeFirstResponder(self)
+		if selectedRow < 0 {
+			selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+		}
+		scrollRowToVisible(max(selectedRow, 0))
+	}
+
 	// cancels the pending overlay and hides the shown one
 	func endHover() {
 		hoverTimer?.invalidate()
@@ -486,6 +526,9 @@ final class ResultsNSTableView: NSTableView {
 			case (36, []), (76, []): vAction = .primary          // Return / Enter
 			case (36, [.command]), (76, [.command]): vAction = .reveal
 			case (51, [.command]): vAction = .trash              // ⌘⌫
+			case (126, []) where selectedRow <= 0:               // ↑ on the first row
+				NotificationCenter.default.post(name: .allofitFocusSearch, object: nil)
+				return
 			default:
 				if vChars == "y" && vMods == [.command] {
 					vAction = .quickLook
@@ -722,6 +765,13 @@ final class ClosureMenuItem: NSMenuItem {
 	// menu callback
 	@objc private func run(_ inSender: Any?) {
 		handler()
+	}
+
+	// shows a shortcut next to the title and returns the item
+	func showingKey(_ inKey: String, _ inModifiers: NSEvent.ModifierFlags) -> ClosureMenuItem {
+		keyEquivalent = inKey
+		keyEquivalentModifierMask = inModifiers
+		return self
 	}
 }
 

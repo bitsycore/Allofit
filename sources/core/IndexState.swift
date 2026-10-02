@@ -133,9 +133,10 @@ struct IndexState {
 	// directories that newly appeared. inRoots are the configured roots,
 	// whose own records are allowed without an indexed parent.
 	mutating func apply(inChanges: ResolvedChanges,
-						inRoots: Set<String>) -> (changed: Bool, rescans: [String]) {
+						inRoots: Set<String>) -> (changed: Bool, rescans: [String], newFolders: [String]) {
 		var vChanged = false
 		var vRescans: [String] = []
+		var vNewFolders: [String] = []
 
 		// removals first: a rename shows up as old path gone + new path present
 		if !inChanges.removals.isEmpty {
@@ -151,7 +152,7 @@ struct IndexState {
 			let vIsNew = positions[vRecord.id] == nil
 			if upsert(vRecord) { vChanged = true }
 			if vIsNew && vRecord.isDirectory {
-				vRescans.append(vRecord.fullPath)
+				vNewFolders.append(vRecord.fullPath)
 			}
 		}
 
@@ -159,7 +160,23 @@ struct IndexState {
 		for vPath in inChanges.rescans where inRoots.contains(vPath) || contains(inPath: vPath) {
 			vRescans.append(vPath)
 		}
-		return (vChanged, SubtreeMatcher.minimalRoots(inPaths: vRescans))
+		let vMinimalRescans = SubtreeMatcher.minimalRoots(inPaths: vRescans)
+		// a new folder inside a kernel rescan is walked by that rescan
+		let vCovered = SubtreeMatcher(inRoots: vMinimalRescans)
+		let vFolders = SubtreeMatcher.minimalRoots(inPaths: vNewFolders).filter { vFolder in
+			!vMinimalRescans.contains(vFolder) && !vCovered.containsChild(inParentPath: (vFolder as NSString).deletingLastPathComponent)
+		}
+		return (vChanged, vMinimalRescans, vFolders)
+	}
+
+	// adds the records found by walking folders that just appeared. Nothing
+	// below such a folder can be indexed yet (except entries upserted from
+	// the same FSEvents batch, which upsert replaces), so unlike
+	// replaceSubtrees no O(n) removal pass over the whole index is needed.
+	mutating func mergeNewFolders(inRecords: [FileRecord]) {
+		for vRecord in inRecords {
+			upsert(vRecord)
+		}
 	}
 
 	// drops records that fall outside the current configuration: excluded

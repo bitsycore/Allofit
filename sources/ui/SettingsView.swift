@@ -291,7 +291,7 @@ private struct ExclusionsTab: View {
 			.frame(minHeight: 180)
 
 			HStack {
-				TextField("Path or tilde-expanded path", text: $newExclusion)
+				TextField("Path, e.g. ~/Projects/build", text: $newExclusion)
 					.textFieldStyle(.roundedBorder)
 				Button("Add") {
 					let vTrim = newExclusion.trimmingCharacters(in: .whitespaces)
@@ -499,13 +499,30 @@ private struct ServiceTab: View {
 	// status doesn't observe @Published changes since it reads file
 	// system state directly, so we need an explicit refresh signal
 	@State private var statusTick: Int = 0
+	// mode picked in the radio group; only saved by a successful Install
+	// (or Uninstall), so picking a mode alone never leaves the app waiting
+	// on a service that doesn't exist
+	@State private var draftMode: Preferences.ServiceMode?
+	// confirmation for Uninstall
+	@State private var confirmUninstall = false
 
+	// the mode shown and acted on: the draft, else the saved mode
+	private var chosenMode: Preferences.ServiceMode {
+		return draftMode ?? prefs.serviceMode
+	}
+
+	// launchd scope of the chosen mode, nil for Off
 	private var scope: ServiceInstaller.Scope? {
-		switch prefs.serviceMode {
+		switch chosenMode {
 			case .none: return nil
 			case .userAgent: return .userAgent
 			case .rootDaemon: return .rootDaemon
 		}
+	}
+
+	// the radio group writes the draft, not the preference
+	private var modeBinding: Binding<Preferences.ServiceMode> {
+		Binding(get: { chosenMode }, set: { draftMode = $0 })
 	}
 
 	var body: some View {
@@ -513,15 +530,22 @@ private struct ServiceTab: View {
 			Text("Background service")
 				.font(.headline)
 
-			Picker("Mode", selection: $prefs.serviceMode) {
+			Picker("Mode", selection: modeBinding) {
 				Text("Off (GUI maintains the index)").tag(Preferences.ServiceMode.none)
 				Text("User service (LaunchAgent, no admin needed)").tag(Preferences.ServiceMode.userAgent)
 				Text("System service (LaunchDaemon as root, scans everything)").tag(Preferences.ServiceMode.rootDaemon)
 			}
 			.pickerStyle(.radioGroup)
 
+			if prefs.serviceMode != .none && model.activeServiceMode == .none {
+				Text("The saved service isn't installed, so Allofit is indexing on its own. Install it again or choose Off.")
+					.font(.callout)
+					.foregroundColor(.orange)
+					.fixedSize(horizontal: false, vertical: true)
+			}
+
 			Group {
-				switch prefs.serviceMode {
+				switch chosenMode {
 					case .none:
 						Text("The GUI process indexes and saves the cache itself.")
 							.foregroundColor(.secondary)
@@ -584,7 +608,7 @@ private struct ServiceTab: View {
 						Text("• Prompt once for your administrator password (steps run as one privileged script).")
 							.font(.caption)
 					}
-					Text("Reinstall any time you rebuild Allofit.app - the on-disk copy doesn't auto-update.")
+					Text("Reinstall after updating Allofit: the service runs its own copy of the app, which doesn't update by itself.")
 						.font(.caption)
 						.foregroundColor(.secondary)
 						.padding(.top, 2)
@@ -604,22 +628,37 @@ private struct ServiceTab: View {
 		_ = statusTick  // re-read the file-system status on each tick
 		return HStack {
 			Button("Install") {
-				Task { await model.performInstallService() }
+				let vMode = chosenMode
+				Task {
+					await model.performInstallService(inMode: vMode)
+					draftMode = nil
+				}
 			}
-			.disabled(prefs.serviceMode == .none || model.isWorking)
-			Button("Uninstall") {
-				Task { await model.performUninstallService() }
-			}
-			.disabled(prefs.serviceMode == .none || !vInstalled || model.isWorking)
+			.disabled(chosenMode == .none || model.isWorking)
+			Button("Uninstall…") { confirmUninstall = true }
+				.disabled(chosenMode == .none || !vInstalled || model.isWorking)
 			Button("Stop") {
-				Task { await model.performStopService() }
+				let vMode = chosenMode
+				Task { await model.performStopService(inMode: vMode) }
 			}
 			.disabled(!vInstalled || !vRunning || model.isWorking)
 			Button("Start") {
-				Task { await model.performStartService() }
+				let vMode = chosenMode
+				Task { await model.performStartService(inMode: vMode) }
 			}
 			.disabled(!vInstalled || vRunning || model.isWorking)
 			Spacer()
+		}
+		.confirmationDialog("Uninstall the background service?", isPresented: $confirmUninstall) {
+			Button("Uninstall", role: .destructive) {
+				let vMode = chosenMode
+				Task {
+					await model.performUninstallService(inMode: vMode)
+					draftMode = nil
+				}
+			}
+		} message: {
+			Text("Allofit goes back to indexing on its own while it's open.")
 		}
 	}
 
@@ -702,6 +741,8 @@ private struct CacheTab: View {
 
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var model: AppModel
+	// confirmation for Clear Cache
+	@State private var confirmClear = false
 
 	var body: some View {
 		VStack(alignment: .leading, spacing: 12) {
@@ -759,10 +800,17 @@ private struct CacheTab: View {
 				if model.isWorking {
 					ProgressView().controlSize(.small)
 				}
-				Button("Clear Cache", role: .destructive) {
-					Task { await model.performClearCache() }
+				Button("Clear Cache…", role: .destructive) {
+					confirmClear = true
 				}
 				.disabled(model.isWorking)
+				.confirmationDialog("Clear the index cache?", isPresented: $confirmClear) {
+					Button("Clear and Rebuild", role: .destructive) {
+						Task { await model.performClearCache() }
+					}
+				} message: {
+					Text("The whole index is rebuilt from scratch, which can take a few minutes.")
+				}
 			}
 
 			if !model.workMessage.isEmpty {
@@ -850,7 +898,7 @@ private struct DiagnosticsTab: View {
 				LabeledContent("Indexer lock holder") {
 					Text(daemonStatus)
 						.font(.callout)
-						.foregroundColor(daemonStatus.contains("running") ? .primary : .red)
+						.foregroundColor(daemonStatus.hasPrefix("running") ? .primary : .red)
 				}
 				LabeledContent("Service plist") {
 					Text(servicePlistStatus())
@@ -860,7 +908,7 @@ private struct DiagnosticsTab: View {
 
 			Divider()
 
-			Text("Service log tail (/tmp/allofit-service.err)")
+			Text("Service log tail (\(DiagnosticsTab.logPath(inMode: prefs.serviceMode) ?? "no service"))")
 				.font(.subheadline)
 			ScrollView {
 				Text(serviceLogTail)
@@ -875,8 +923,12 @@ private struct DiagnosticsTab: View {
 			HStack {
 				Button("Refresh now") { refresh() }
 				Button("Open log") {
-					NSWorkspace.shared.open(URL(fileURLWithPath: "/tmp/allofit-service.err"))
+					// revealed rather than opened: Finder never runs it
+					if let vPath = DiagnosticsTab.logPath(inMode: prefs.serviceMode) {
+						NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: vPath)])
+					}
 				}
+				.disabled(DiagnosticsTab.logPath(inMode: prefs.serviceMode) == nil)
 				Spacer()
 				Text("auto-refresh every 2s")
 					.font(.caption)
@@ -893,7 +945,7 @@ private struct DiagnosticsTab: View {
 	private func refresh() {
 		Task.detached {
 			let vStatus = await DiagnosticsTab.computeDaemonStatus(inMode: Preferences.shared.serviceMode)
-			let vLog = DiagnosticsTab.readLogTail()
+			let vLog = DiagnosticsTab.readLogTail(inPath: DiagnosticsTab.logPath(inMode: Preferences.shared.serviceMode))
 			await MainActor.run {
 				self.daemonStatus = vStatus
 				self.serviceLogTail = vLog
@@ -931,9 +983,18 @@ private struct DiagnosticsTab: View {
 		return "stale lock (pid \(vPid) not running)"
 	}
 
-	// reads the last 30 lines of the service stderr log file
-	private nonisolated static func readLogTail() -> String {
-		let vPath = "/tmp/allofit-service.err"
+	// log file of the service for a mode, nil when no service is used
+	nonisolated static func logPath(inMode: Preferences.ServiceMode) -> String? {
+		switch inMode {
+			case .none: return nil
+			case .userAgent: return ServiceInstaller.logPath(inScope: .userAgent)
+			case .rootDaemon: return ServiceInstaller.logPath(inScope: .rootDaemon)
+		}
+	}
+
+	// reads the last 30 lines of the service log file
+	private nonisolated static func readLogTail(inPath: String?) -> String {
+		guard let vPath = inPath else { return "(no background service: Allofit indexes in its own process)" }
 		guard let vData = try? Data(contentsOf: URL(fileURLWithPath: vPath)),
 			  let vText = String(data: vData, encoding: .utf8)
 		else {

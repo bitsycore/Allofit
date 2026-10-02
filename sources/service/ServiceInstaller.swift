@@ -67,6 +67,10 @@ enum ServiceInstaller {
 					at: vTarget.deletingLastPathComponent(),
 					withIntermediateDirectories: true
 				)
+				try? FileManager.default.createDirectory(
+					atPath: (logPath(inScope: .userAgent) as NSString).deletingLastPathComponent,
+					withIntermediateDirectories: true
+				)
 				try vPlistData.write(to: vTarget, options: .atomic)
 				_ = runLaunchctl(inArgs: ["unload", vTarget.path])
 				let vResult = runLaunchctl(inArgs: ["load", "-w", vTarget.path])
@@ -78,11 +82,13 @@ enum ServiceInstaller {
 				// root daemon install: binary copy + plist install + boot
 				// happen inside a single admin-priv script so the user
 				// gets ONE password prompt covering all of it
-				let vTmp = FileManager.default.temporaryDirectory
-					.appendingPathComponent("\(kLabel).plist")
-				try vPlistData.write(to: vTmp, options: .atomic)
+				// The plist travels inside the script as base64 (only
+				// [A-Za-z0-9+/=], safe in single quotes) instead of a temp
+				// file a user process could swap before root copies it in.
+				let vPlistBase64 = vPlistData.base64EncodedString()
 				let vTarget = rootDaemonPath()
 				let vDaemonDir = (vDaemonBinary as NSString).deletingLastPathComponent
+				let vLogDir = (logPath(inScope: .rootDaemon) as NSString).deletingLastPathComponent
 				let vScript = """
 				mkdir -p \(AdminShell.quote(vDaemonDir)) \
 				&& rm -f \(AdminShell.quote(vDaemonBinary)) \
@@ -91,7 +97,11 @@ enum ServiceInstaller {
 				&& chmod 755 \(AdminShell.quote(vDaemonBinary)) \
 				&& printf '%s' \(AdminShell.quote(vVersionString)) > \(AdminShell.quote(vVersionFile)) \
 				&& chmod 644 \(AdminShell.quote(vVersionFile)) \
-				&& cp \(AdminShell.quote(vTmp.path)) \(AdminShell.quote(vTarget.path)) \
+				&& mkdir -p \(AdminShell.quote(vLogDir)) \
+				&& chown root:wheel \(AdminShell.quote(vLogDir)) \
+				&& chmod 755 \(AdminShell.quote(vLogDir)) \
+				&& printf '%s' \(AdminShell.quote(vPlistBase64)) | /usr/bin/base64 -D > \(AdminShell.quote(vTarget.path)) \
+				&& /usr/bin/plutil -lint -s \(AdminShell.quote(vTarget.path)) \
 				&& chown root:wheel \(AdminShell.quote(vTarget.path)) \
 				&& chmod 644 \(AdminShell.quote(vTarget.path)) \
 				; /bin/launchctl bootout system \(AdminShell.quote(vTarget.path)) 2>/dev/null \
@@ -252,14 +262,31 @@ enum ServiceInstaller {
 		}
 	}
 
+	// where the service's stdout / stderr go: a root-owned folder for the
+	// daemon, the user's own Logs folder for the agent
+	static func logPath(inScope: Scope) -> String {
+		switch inScope {
+			case .userAgent:
+				return FileManager.default.homeDirectoryForCurrentUser
+					.appendingPathComponent("Library/Logs/Allofit/service.log").path
+			case .rootDaemon:
+				return "/Library/Logs/Allofit/service.log"
+		}
+	}
+
 	// resolves an absolute path to the currently running binary
 	private static func resolveBinaryPath() throws -> String {
-		let vArg0 = CommandLine.arguments[0]
-		let vAbs = (vArg0 as NSString).standardizingPath
-		if FileManager.default.fileExists(atPath: vAbs) { return vAbs }
-		if let vUrl = Bundle.main.executableURL,
+		// the loaded executable, not argv[0] (which a caller can set to
+		// anything, including a relative path)
+		if let vUrl = Bundle.main.executableURL?.resolvingSymlinksInPath(),
+		   vUrl.path.hasPrefix("/"),
 		   FileManager.default.fileExists(atPath: vUrl.path) {
 			return vUrl.path
+		}
+		let vArg0 = CommandLine.arguments[0]
+		let vAbs = (vArg0 as NSString).standardizingPath
+		if vAbs.hasPrefix("/") && FileManager.default.fileExists(atPath: vAbs) {
+			return vAbs
 		}
 		throw InstallError.binaryNotFound
 	}
@@ -271,8 +298,10 @@ enum ServiceInstaller {
 			"ProgramArguments": [inBinary, "--service"],
 			"RunAtLoad": true,
 			"KeepAlive": true,
-			"StandardOutPath": "/tmp/allofit-service.log",
-			"StandardErrorPath": "/tmp/allofit-service.err",
+			// never /tmp: a fixed name there can be pre-created as a symlink
+			// by any local user, and launchd opens it as root for the daemon
+			"StandardOutPath": logPath(inScope: inScope),
+			"StandardErrorPath": logPath(inScope: inScope),
 			"ThrottleInterval": 10
 		]
 		if inScope == .rootDaemon {

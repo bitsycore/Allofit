@@ -49,14 +49,11 @@ enum IndexStore {
 				in: .userDomainMask
 			).first!
 		}
-		let vDir = vBase.appendingPathComponent("Allofit", isDirectory: true)
-		try? FileManager.default.createDirectory(at: vDir, withIntermediateDirectories: true)
-		// for the system-wide path the directory may have been created by the
-		// root daemon - make sure non-root users (the GUI) can traverse it
-		if inSystem {
-			chmod(vDir.path, 0o755)
-		}
-		return vDir.appendingPathComponent("index.bin")
+		// pure path computation (no disk access: it's called from views);
+		// saveImpl creates the folder when it writes
+		return vBase
+			.appendingPathComponent("Allofit", isDirectory: true)
+			.appendingPathComponent("index.bin")
 	}
 
 	// returns the URL appropriate for a given service mode
@@ -137,25 +134,50 @@ enum IndexStore {
 		writeU64(into: &vEnvelope, value: vUncompressedSize)
 		vEnvelope.append(vCompressed)
 
-		let vTmp = inUrl.appendingPathExtension("tmp")
+		// the folder may not exist yet (first save). The system-wide one must
+		// stay traversable by the GUI user; the index inside is owner-only
+		// (see restrictAccess)
+		let vDir = inUrl.deletingLastPathComponent()
+		try? FileManager.default.createDirectory(at: vDir, withIntermediateDirectories: true)
+		if getuid() == 0 {
+			chmod(vDir.path, 0o755)
+		}
+		// unique per save: two saves running at once (reindex and autosave
+		// on different queues) must not write the same temp file
+		let vTmp = inUrl.deletingLastPathComponent()
+			.appendingPathComponent(".\(inUrl.lastPathComponent).\(UUID().uuidString).tmp")
 		do {
-			try vEnvelope.write(to: vTmp, options: .atomic)
-			_ = try FileManager.default.replaceItem(
-				at: inUrl,
-				withItemAt: vTmp,
-				backupItemName: nil,
-				options: [],
-				resultingItemURL: nil
-			)
-			// the root daemon writes this file owned by root. The GUI runs
-			// as the user and must be able to read it, so force world-read
-			// permissions regardless of the process's umask.
-			chmod(inUrl.path, 0o644)
+			try vEnvelope.write(to: vTmp)
+			// owner-only access, set on the temp file *before* it becomes
+			// the cache, so the index (a listing of every file name) is
+			// never readable by other local users, even for a moment
+			restrictAccess(inPath: vTmp.path)
+			// rename(2) is atomic and keeps the temp file's owner and mode
+			// (FileManager.replaceItem may carry over the old file's)
+			guard rename(vTmp.path, inUrl.path) == 0 else {
+				throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+			}
 		} catch {
 			NSLog("[Allofit] cache save failed at %@: %@", inUrl.path, "\(error)")
 			try? FileManager.default.removeItem(at: vTmp)
 		}
 	}
+
+	// makes a cache file readable by its owner only. The root daemon hands
+	// it to the user who installed the service (the GUI reads it as that
+	// user); everyone else gets nothing.
+	private static func restrictAccess(inPath: String) {
+		if getuid() == 0,
+		   let vOwner = ProcessInfo.processInfo.environment["ALLOFIT_OWNER_USER"],
+		   let vEntry = getpwnam(vOwner) {
+			chown(inPath, vEntry.pointee.pw_uid, vEntry.pointee.pw_gid)
+		}
+		chmod(inPath, 0o600)
+	}
+
+	// largest uncompressed payload accepted from a cache file (a corrupt or
+	// crafted header must not make the loader allocate without bound)
+	private static let kMaxPayloadBytes: UInt64 = 8 << 30
 
 	// reads the persisted index back from the default cacheURL
 	static func load() -> LoadResult? {
@@ -177,7 +199,8 @@ enum IndexStore {
 		var vOffset = 0
 		guard let vMagic = readU32(from: vData, offset: &vOffset), vMagic == kMagic else { return nil }
 		guard let vVersion = readU32(from: vData, offset: &vOffset), vVersion == kVersion else { return nil }
-		guard let _ = readU64(from: vData, offset: &vOffset) else { return nil }  // uncompressed size, advisory only
+		guard let vDeclaredSize = readU64(from: vData, offset: &vOffset),
+			  vDeclaredSize <= kMaxPayloadBytes else { return nil }
 
 		let vCompressed = vData.subdata(in: vOffset..<vData.count)
 		let vPayload: Data
@@ -187,6 +210,7 @@ enum IndexStore {
 			NSLog("[Allofit] LZ4 decompression failed: \(error)")
 			return nil
 		}
+		guard UInt64(vPayload.count) == vDeclaredSize else { return nil }
 
 		var vP = 0
 		guard let vLastEventId = readU64(from: vPayload, offset: &vP) else { return nil }

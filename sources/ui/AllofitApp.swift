@@ -46,6 +46,13 @@ struct AllofitApp: App {
 			// ⌘F focuses the search field. Standard Find-style shortcut.
 			// SearchField's Coordinator observes the notification and calls
 			// makeFirstResponder on its underlying NSSearchField.
+			// Help: the syntax cheat sheet and the project page
+			CommandGroup(replacing: .help) {
+				Button("Search Syntax") { showSyntaxWindow() }
+				Button("Allofit on GitHub") {
+					NSWorkspace.shared.open(URL(string: "https://github.com/bitsycore/Allofit#search")!)
+				}
+			}
 			CommandGroup(after: .pasteboard) {
 				Button("Find") {
 					NotificationCenter.default.post(name: .allofitFocusSearch, object: nil)
@@ -215,6 +222,28 @@ struct WindowVisibilityReporter: NSViewRepresentable {
 	func updateNSView(_ inView: NSView, context inContext: Context) {
 		(inView as? ReporterView)?.onChange = onChange
 	}
+}
+
+// the Help > Search Syntax window (kept so a second click just brings it back)
+@MainActor private var syntaxWindow: NSWindow?
+
+// shows the search syntax cheat sheet in a small utility window
+@MainActor private func showSyntaxWindow() {
+	if syntaxWindow == nil {
+		let vWindow = NSPanel(
+			contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+			styleMask: [.titled, .closable, .utilityWindow],
+			backing: .buffered,
+			defer: false
+		)
+		vWindow.title = "Allofit Search Syntax"
+		vWindow.isReleasedWhenClosed = false
+		vWindow.contentView = NSHostingView(rootView: SyntaxHelpView())
+		vWindow.setContentSize(vWindow.contentView?.fittingSize ?? NSSize(width: 560, height: 420))
+		vWindow.center()
+		syntaxWindow = vWindow
+	}
+	syntaxWindow?.makeKeyAndOrderFront(nil)
 }
 
 // Opens the standard macOS About panel with a clickable GitHub link in the
