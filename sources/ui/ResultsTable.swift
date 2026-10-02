@@ -438,6 +438,10 @@ final class ResultCellView: NSTableCellView {
 		vLabel.translatesAutoresizingMaskIntoConstraints = false
 		vLabel.lineBreakMode = .byTruncatingTail
 		vLabel.cell?.usesSingleLineMode = true
+		// hovering a cut-off name / path shows the full text right away,
+		// drawn over the cell (Finder's expansion tooltip), instead of a
+		// help tag that waits for the tooltip delay
+		vLabel.allowsExpansionToolTips = true
 		addSubview(vLabel)
 		textField = vLabel
 		if inWithIcon {
@@ -473,7 +477,6 @@ final class ResultCellView: NSTableCellView {
 		terms = inTerms
 		isSecondary = inSecondary
 		textField?.lineBreakMode = inMiddleTruncation ? .byTruncatingMiddle : .byTruncatingTail
-		textField?.toolTip = inText
 		render()
 	}
 

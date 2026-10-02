@@ -262,11 +262,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// bundle - covers the SwiftPM "swift run" case
 		NSApp.setActivationPolicy(.regular)
 		NSApp.activate(ignoringOtherApps: true)
-		// shrink the AppKit help-tag (.help() / NSView.toolTip) hover delay.
-		// The system default is ~2 s; that makes truncated Name/Path cells
-		// feel unreadable. Registered as a default so a user-set value in
-		// the global domain still wins. Seconds.
-		UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0.3])
+		// shrink the AppKit help-tag (.help() / NSView.toolTip) hover delay
+		// from the ~1-2 s system default. Registered as a default so a
+		// user-set value in the global domain still wins. The value is in
+		// milliseconds (it used to be registered as 0.3, read as 0 ms).
+		UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 250])
 		// wipe any elevated-access staging files left over from a previous
 		// run so a crash or hard-kill doesn't accumulate privileged copies
 		// in ~/Library/Caches across sessions
