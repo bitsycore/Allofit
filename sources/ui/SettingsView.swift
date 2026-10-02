@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 
 // SettingsView is the multi-tab Preferences window. It exposes roots,
-// exclusions, mounted volume inclusion, background service installation,
-// and on-disk cache management.
+// exclusions, mounted volume inclusion, update / refresh timings,
+// background service installation, and on-disk cache management.
 struct SettingsView: View {
 
 	@EnvironmentObject var model: AppModel
@@ -17,6 +17,8 @@ struct SettingsView: View {
 				.tabItem { Label("Exclusions", systemImage: "minus.circle") }
 			VolumesTab()
 				.tabItem { Label("Volumes", systemImage: "externaldrive") }
+			PerformanceTab()
+				.tabItem { Label("Performance", systemImage: "speedometer") }
 			ServiceTab()
 				.tabItem { Label("Service", systemImage: "gearshape.2") }
 			CacheTab()
@@ -212,7 +214,100 @@ private struct VolumesTab: View {
 }
 
 // ===========================
-// MARK: service tab
+// MARK: Performance tab
+// ===========================
+
+// PerformanceTab sets how quickly file changes reach the index and the open
+// search results, per app state. Longer delays when Allofit isn't being
+// looked at keep it nearly idle in the background; focusing a window always
+// catches up at once.
+private struct PerformanceTab: View {
+
+	@EnvironmentObject var prefs: Preferences
+
+	// preset choices offered by each picker, in seconds
+	private let kForegroundDelays: [Double] = [0.5, 1, 2, 3, 5, 10]
+	private let kBackgroundDelays: [Double] = [3, 5, 10, 15, 30, 60, 120]
+	private let kHiddenDelays: [Double] = [15, 30, 60, 120, 300, 600]
+	private let kForegroundRefreshes: [Double] = [0.5, 1, 2, 3, 5]
+	private let kBackgroundRefreshes: [Double] = [1, 3, 5, 10, 20, 30]
+	// FSEvents' own delivery latency, added to the estimates
+	private let kEventLatency: Double = 0.2
+
+	var body: some View {
+		VStack(alignment: .leading, spacing: 12) {
+			Text("Index updates")
+				.font(.headline)
+			Text("How long file changes are collected before they are applied to the index. Longer delays mean less work: repeated writes to the same file are checked only once.")
+				.font(.caption)
+				.foregroundColor(.secondary)
+				.fixedSize(horizontal: false, vertical: true)
+			Form {
+				secondsPicker("While Allofit is focused", inChoices: kForegroundDelays, inValue: $prefs.updateDelayForeground)
+				secondsPicker("While another app is focused", inChoices: kBackgroundDelays, inValue: $prefs.updateDelayBackground)
+				secondsPicker("With no window visible", inChoices: kHiddenDelays, inValue: $prefs.updateDelayHidden)
+			}
+
+			Divider()
+
+			Text("Result refresh")
+				.font(.headline)
+			Text("Minimum time between two refreshes of the open search results when files change. Typing always searches immediately.")
+				.font(.caption)
+				.foregroundColor(.secondary)
+				.fixedSize(horizontal: false, vertical: true)
+			Form {
+				secondsPicker("While Allofit is focused", inChoices: kForegroundRefreshes, inValue: $prefs.refreshIntervalForeground)
+				secondsPicker("While another app is focused", inChoices: kBackgroundRefreshes, inValue: $prefs.refreshIntervalBackground)
+			}
+
+			Divider()
+
+			Text(summaryText)
+				.font(.callout)
+				.foregroundColor(.secondary)
+				.fixedSize(horizontal: false, vertical: true)
+			HStack {
+				Spacer()
+				Button("Restore Defaults") { prefs.resetTimings() }
+			}
+			Spacer()
+		}
+	}
+
+	// a picker over preset durations; a stored value outside the presets
+	// (set by hand) is kept selectable instead of showing a blank picker
+	private func secondsPicker(_ inLabel: String, inChoices: [Double], inValue: Binding<Double>) -> some View {
+		let vChoices = Array(Set(inChoices + [inValue.wrappedValue])).sorted()
+		return Picker(inLabel, selection: inValue) {
+			ForEach(vChoices, id: \.self) { vSeconds in
+				Text(Self.durationText(inSeconds: vSeconds)).tag(vSeconds)
+			}
+		}
+		.frame(maxWidth: 360)
+	}
+
+	// estimated delay before a changed file appears in the results
+	private var summaryText: String {
+		let vForeground = kEventLatency + prefs.updateDelayForeground + prefs.refreshIntervalForeground
+		let vBackground = kEventLatency + prefs.updateDelayBackground + prefs.refreshIntervalBackground
+		return "A changed file shows up in the results after about \(Self.durationText(inSeconds: vForeground)) while Allofit is focused, and \(Self.durationText(inSeconds: vBackground)) while another app is. With no window visible nothing is refreshed; showing a window applies every pending change at once."
+	}
+
+	// "0.5 s", "15 s", "1 min", "1 min 30 s"
+	private static func durationText(inSeconds: Double) -> String {
+		if inSeconds < 60 {
+			let vRounded = (inSeconds * 10).rounded() / 10
+			return vRounded == vRounded.rounded() ? "\(Int(vRounded)) s" : String(format: "%.1f s", vRounded)
+		}
+		let vMinutes = Int(inSeconds) / 60
+		let vRest = Int(inSeconds) % 60
+		return vRest == 0 ? "\(vMinutes) min" : "\(vMinutes) min \(vRest) s"
+	}
+}
+
+// ===========================
+// MARK: Service tab
 // ===========================
 
 // ServiceTab manages the LaunchAgent / LaunchDaemon that keeps the index

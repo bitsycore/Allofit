@@ -33,8 +33,31 @@ private final class PendingChanges: @unchecked Sendable {
 	private var changes: [FSChange] = []
 	// true while a flush is scheduled but has not drained yet
 	private var flushScheduled = false
-	// guards changes and flushScheduled
+	// how long changes are collected before a flush (follows AppActivity)
+	private var delaySeconds: TimeInterval = 2
+	// guards every field above
 	private let lock = NSLock()
+
+	// current collection delay before a flush
+	var coalesceDelay: TimeInterval {
+		lock.lock()
+		defer { lock.unlock() }
+		return delaySeconds
+	}
+
+	// changes the collection delay used for the next flushes
+	func setCoalesceDelay(_ inSeconds: TimeInterval) {
+		lock.lock()
+		delaySeconds = inSeconds
+		lock.unlock()
+	}
+
+	// true when changes are waiting to be flushed
+	var hasPending: Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		return !changes.isEmpty
+	}
 
 	// appends a batch; returns true if the caller must schedule a flush
 	func append(inChanges: [FSChange]) -> Bool {
@@ -89,6 +112,9 @@ final class AppModel: ObservableObject {
 	var allRecords: [FileRecord] { index.records }
 	// fires on main after allRecords changed (no payload by design)
 	let recordsChanged = PassthroughSubject<Void, Never>()
+	// when the index last changed; read by the status bar on its own
+	// refresh tick, so deliberately not @Published
+	private(set) var lastIndexChangeAt: Date?
 	// total number of entries indexed (used for the status bar)
 	@Published private(set) var indexedCount: Int = 0
 	// true while a full reindex is in progress
@@ -100,8 +126,6 @@ final class AppModel: ObservableObject {
 
 	// how often the index is written to disk while running (seconds)
 	private let kAutosaveSeconds: TimeInterval = 30
-	// delay used to coalesce FSEvents batches before resolving them
-	private let kChangeCoalesceSeconds: TimeInterval = 0.5
 	// delay before a roots / exclusions edit is applied to the live index
 	private let kConfigDebounceSeconds: TimeInterval = 1.0
 
@@ -117,6 +141,8 @@ final class AppModel: ObservableObject {
 	private let pendingChanges = PendingChanges()
 	// roots the watcher was started with; their own records need no parent
 	private var watchedRoots: Set<String> = []
+	// exclusions the running watcher resolves changes with
+	private var currentExclusions: ExclusionMatcher?
 	// bumped whenever the whole index is replaced, so a subtree rescan that
 	// started against the previous index doesn't merge into the new one
 	private var indexGeneration = 0
@@ -163,6 +189,26 @@ final class AppModel: ObservableObject {
 				}
 			}
 			.store(in: &cancellables)
+		// slow index updates down while the app isn't being looked at, and
+		// catch up at once when a window comes back
+		AppActivity.shared.$level
+			.removeDuplicates()
+			.sink { [weak self] vLevel in
+				self?.activityChanged(inLevel: vLevel)
+			}
+			.store(in: &cancellables)
+		// the delays are user settings: apply edits right away
+		Publishers.Merge3(
+			prefs.$updateDelayForeground,
+			prefs.$updateDelayBackground,
+			prefs.$updateDelayHidden
+		)
+		.dropFirst(3)
+		.receive(on: DispatchQueue.main)
+		.sink { [weak self] _ in
+			self?.activityChanged(inLevel: AppActivity.shared.level)
+		}
+		.store(in: &cancellables)
 		// apply roots / exclusions / volume edits to the live index
 		Publishers.Merge4(
 			prefs.$rootPaths.map { _ in () },
@@ -498,22 +544,51 @@ final class AppModel: ObservableObject {
 		pendingChanges.reset()
 		let vPending = pendingChanges
 		let vQueue = indexQueue
-		let vDelay = kChangeCoalesceSeconds
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
+		currentExclusions = vMatcher
 		watcher.start(
 			inRoots: vRoots,
 			inSinceWhen: FSEventStreamEventId(inSinceWhen)
 		) { [weak self] vChanges in
 			guard vPending.append(inChanges: vChanges) else { return }
-			vQueue.asyncAfter(deadline: .now() + vDelay) { [weak self] in
-				let vResolved = IndexState.resolve(
-					inChanges: vPending.drain(),
-					inExclusions: vMatcher
-				)
-				DispatchQueue.main.async {
-					self?.applyResolvedChanges(inResolved: vResolved)
-				}
+			vQueue.asyncAfter(deadline: .now() + vPending.coalesceDelay) { [weak self] in
+				AppModel.flush(inPending: vPending, inExclusions: vMatcher, inModel: self)
 			}
+		}
+	}
+
+	// resolves everything pending (on the calling background queue) and
+	// merges the result on main
+	private nonisolated static func flush(inPending: PendingChanges,
+										  inExclusions: ExclusionMatcher,
+										  inModel: AppModel?) {
+		let vChanges = inPending.drain()
+		// an early catch-up flush may already have taken everything
+		guard !vChanges.isEmpty else { return }
+		let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: inExclusions)
+		DispatchQueue.main.async { [weak inModel] in
+			inModel?.applyResolvedChanges(inResolved: vResolved)
+		}
+	}
+
+	// adapts the update cadence to the visibility level (delays from
+	// Settings > Performance). Longer collection windows when nobody looks
+	// mean fewer wake-ups and fewer stats, since repeated writes to one file
+	// collapse into one check. When the app becomes more visible (or a
+	// delay is shortened), pending changes are applied right away.
+	private func activityChanged(inLevel: AppActivity.Level) {
+		let vDelay: TimeInterval
+		switch inLevel {
+			case .foreground: vDelay = prefs.updateDelayForeground
+			case .background: vDelay = prefs.updateDelayBackground
+			case .hidden: vDelay = prefs.updateDelayHidden
+		}
+		let vPrevious = pendingChanges.coalesceDelay
+		pendingChanges.setCoalesceDelay(vDelay)
+		guard vDelay < vPrevious, isIndexer, pendingChanges.hasPending, let vMatcher = currentExclusions else { return }
+		let vPending = pendingChanges
+		indexQueue.async { [weak self] in
+			AppModel.flush(inPending: vPending, inExclusions: vMatcher, inModel: self)
 		}
 	}
 
@@ -707,6 +782,7 @@ final class AppModel: ObservableObject {
 
 	// notifies observers that the records changed
 	private func publishRecords() {
+		lastIndexChangeAt = Date()
 		if indexedCount != index.count {
 			indexedCount = index.count
 		}

@@ -104,8 +104,8 @@ struct ContentView: View {
 			searchBar
 			resultsTable
 			Divider()
-			StatusBarView()  // isolated so its @Published refresh
-							 // doesn't re-evaluate the Table closure
+			// isolated so its refreshes don't re-evaluate the Table closure
+			StatusBarView(stats: searchModel.stats)
 		}
 	}
 
@@ -153,11 +153,11 @@ struct ContentView: View {
 	// ===========================
 
 	private var resultsTable: some View {
-		// Uses the explicit `rows:` form of Table so `.draggable` lives on
+		// Uses the explicit `rows:` form of Table so the drag source lives on
 		// TableRow rather than embedded in cell content. Cell-content
-		// draggable installs a SwiftUI drag-gesture recognizer that races
-		// with NSTableView's mouseDown→selection event on macOS 26 and
-		// occasionally eats left-clicks; row-level draggable doesn't.
+		// drag modifiers install a SwiftUI drag-gesture recognizer that
+		// races with NSTableView's mouseDown→selection event on macOS 26 and
+		// occasionally eats left-clicks; row-level dragging doesn't.
 		Table(of: FileRecord.self,
 			  selection: $selection,
 			  sortOrder: sortOrderBinding,
@@ -231,7 +231,10 @@ struct ContentView: View {
 		} rows: {
 			ForEach(searchModel.visibleRecords) { vRecord in
 				TableRow(vRecord)
-					.draggable(URL(fileURLWithPath: vRecord.fullPath))
+					// drag the file itself, like Finder (see fileDragProvider)
+					.itemProvider {
+						ContentView.fileDragProvider(for: vRecord)
+					}
 			}
 		}
 		.contextMenu(forSelectionType: FileRecord.ID.self) { vIds in
@@ -253,6 +256,18 @@ struct ContentView: View {
 			QuickLookCoordinator.shared.show(inUrls: vUrls)
 			return .handled
 		}
+	}
+
+	// item provider for dragging a record out of the table. Built from the
+	// NSURL object so AppKit writes it to the drag pasteboard the way Finder
+	// does (public.file-url): browsers then upload the file and apps import
+	// it. .draggable(URL) and NSItemProvider(contentsOf:) only exported a
+	// link / plain text, which makes browsers open the file in place of the
+	// current page.
+	static func fileDragProvider(for inRecord: FileRecord) -> NSItemProvider {
+		let vProvider = NSItemProvider(object: URL(fileURLWithPath: inRecord.fullPath) as NSURL)
+		vProvider.suggestedName = inRecord.name
+		return vProvider
 	}
 
 	// ===========================
@@ -336,14 +351,21 @@ struct ContentView: View {
 // ===========================
 
 // Extracted into its own View so its @Published-driven refreshes (cache
-// load progress, indexed count changes during a scan, service-mode flip)
-// only re-evaluate this small leaf view rather than the ContentView body
-// that contains the Table.
+// load progress, indexed count changes during a scan, service-mode flip,
+// the resource sampler's 2-second tick) only re-evaluate this small leaf
+// view rather than the ContentView body that contains the Table.
 private struct StatusBarView: View {
 
 	@EnvironmentObject var model: AppModel
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var searchModel: WindowSearchModel
+	// per-window match count and search time
+	@ObservedObject var stats: SearchStats
+	// process memory / CPU sampler shared by all windows
+	@ObservedObject private var process = ProcessStats.shared
+
+	// CPU use above which the figure is highlighted (100 = one core)
+	private let kBusyCpuPercent: Double = 50
 
 	var body: some View {
 		HStack(spacing: 8) {
@@ -359,16 +381,18 @@ private struct StatusBarView: View {
 				Text(resultsText)
 			}
 			Spacer()
-			Text(model.isIndexer ? "Indexer" : "Reader")
-				.foregroundColor(.secondary)
-			switch prefs.serviceMode {
-				case .none: EmptyView()
-				case .userAgent: Text("· User service").foregroundColor(.secondary)
-				case .rootDaemon: Text("· Root service").foregroundColor(.secondary)
+			HStack(spacing: 6) {
+				Text(String(format: "%.0f ms", stats.lastSearchMilliseconds))
+				Text("·")
+				Text("RAM \(Formatters.memory(bytes: process.footprintBytes))")
+				Text("·")
+				Text(String(format: "CPU %.0f%%", process.cpuPercent))
+					.foregroundColor(process.cpuPercent >= kBusyCpuPercent ? .orange : .secondary)
+				Text("·")
+				Text(roleText)
 			}
-			if !searchModel.query.isEmpty {
-				Text("· Filtered").foregroundColor(.secondary)
-			}
+			.monospacedDigit()
+			.help(detailsText)
 		}
 		.padding(.horizontal, 12)
 		.padding(.vertical, 4)
@@ -378,12 +402,37 @@ private struct StatusBarView: View {
 
 	// "N results" plus how many are listed when the list is capped
 	private var resultsText: String {
-		let vMatches = searchModel.matchCount
+		let vMatches = stats.matchCount
 		let vShown = searchModel.visibleRecords.count
 		let vIndexed = model.indexedCount.formatted()
 		if vShown < vMatches {
 			return "\(vMatches.formatted()) results (first \(vShown.formatted()) listed)  ·  \(vIndexed) indexed"
 		}
 		return "\(vMatches.formatted()) results  ·  \(vIndexed) indexed"
+	}
+
+	// indexer / reader role, plus the service kind when one is used
+	private var roleText: String {
+		let vRole = model.isIndexer ? "Indexer" : "Reader"
+		switch prefs.serviceMode {
+			case .none: return vRole
+			case .userAgent: return vRole + " · User service"
+			case .rootDaemon: return vRole + " · Root service"
+		}
+	}
+
+	// multi-line tooltip with the full set of figures
+	private var detailsText: String {
+		let vCacheBytes = IndexStore.cacheFileSize(at: IndexStore.cacheURL(forServiceMode: prefs.serviceMode))
+		let vUpdated = model.lastIndexChangeAt.map { $0.formatted(.relative(presentation: .named)) } ?? "never"
+		let vLines = [
+			"Memory: \(Formatters.memory(bytes: process.footprintBytes)) (peak \(Formatters.memory(bytes: process.peakFootprintBytes)))",
+			String(format: "CPU: %.1f%% (100%% = one core)", process.cpuPercent) + "  ·  \(process.threadCount) threads",
+			String(format: "Last search: %.1f ms over ", stats.lastSearchMilliseconds) + "\(model.indexedCount.formatted()) entries",
+			"Index updated: \(vUpdated)",
+			"Cache on disk: \(Formatters.sizeOrDash(bytes: vCacheBytes))",
+			"Roots: \(prefs.rootPaths.count)  ·  Role: \(roleText)"
+		]
+		return vLines.joined(separator: "\n")
 	}
 }

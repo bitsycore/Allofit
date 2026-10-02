@@ -44,6 +44,42 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		didSet { UserDefaults.standard.set(lastSort.rawValue, forKey: Self.kLastSortKey) }
 	}
 
+	// seconds file changes are collected before being applied to the index,
+	// while Allofit is focused / another app is focused / no window shows
+	@Published var updateDelayForeground: Double {
+		didSet { UserDefaults.standard.set(updateDelayForeground, forKey: Self.kUpdateDelayForegroundKey) }
+	}
+	@Published var updateDelayBackground: Double {
+		didSet { UserDefaults.standard.set(updateDelayBackground, forKey: Self.kUpdateDelayBackgroundKey) }
+	}
+	@Published var updateDelayHidden: Double {
+		didSet { UserDefaults.standard.set(updateDelayHidden, forKey: Self.kUpdateDelayHiddenKey) }
+	}
+	// minimum seconds between two result refreshes caused by index changes,
+	// while Allofit is focused / another app is focused
+	@Published var refreshIntervalForeground: Double {
+		didSet { UserDefaults.standard.set(refreshIntervalForeground, forKey: Self.kRefreshForegroundKey) }
+	}
+	@Published var refreshIntervalBackground: Double {
+		didSet { UserDefaults.standard.set(refreshIntervalBackground, forKey: Self.kRefreshBackgroundKey) }
+	}
+
+	// default values of the update / refresh timings, in seconds
+	static let kDefaultUpdateDelayForeground: Double = 2
+	static let kDefaultUpdateDelayBackground: Double = 15
+	static let kDefaultUpdateDelayHidden: Double = 60
+	static let kDefaultRefreshForeground: Double = 1
+	static let kDefaultRefreshBackground: Double = 5
+
+	// puts every update / refresh timing back to its default
+	func resetTimings() {
+		updateDelayForeground = Self.kDefaultUpdateDelayForeground
+		updateDelayBackground = Self.kDefaultUpdateDelayBackground
+		updateDelayHidden = Self.kDefaultUpdateDelayHidden
+		refreshIntervalForeground = Self.kDefaultRefreshForeground
+		refreshIntervalBackground = Self.kDefaultRefreshBackground
+	}
+
 	// service installation modes
 	enum ServiceMode: String, CaseIterable, Identifiable {
 		case none        // no service: GUI indexes in its own process
@@ -58,6 +94,11 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 	private static let kNetworkKey = "Allofit.includeNetworkVolumes"
 	private static let kServiceModeKey = "Allofit.serviceMode"
 	private static let kLastSortKey = "Allofit.lastSort"
+	private static let kUpdateDelayForegroundKey = "Allofit.updateDelayForeground"
+	private static let kUpdateDelayBackgroundKey = "Allofit.updateDelayBackground"
+	private static let kUpdateDelayHiddenKey = "Allofit.updateDelayHidden"
+	private static let kRefreshForegroundKey = "Allofit.refreshIntervalForeground"
+	private static let kRefreshBackgroundKey = "Allofit.refreshIntervalBackground"
 
 	// flushes pending UserDefaults writes to disk so the daemon (which reads
 	// the plist file directly) picks up the latest settings on next start
@@ -90,6 +131,16 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		} else {
 			lastSort = .nameAscending
 		}
+		updateDelayForeground = Self.readDouble(forKey: Self.kUpdateDelayForegroundKey, from: vSourceDict)
+			?? Self.kDefaultUpdateDelayForeground
+		updateDelayBackground = Self.readDouble(forKey: Self.kUpdateDelayBackgroundKey, from: vSourceDict)
+			?? Self.kDefaultUpdateDelayBackground
+		updateDelayHidden = Self.readDouble(forKey: Self.kUpdateDelayHiddenKey, from: vSourceDict)
+			?? Self.kDefaultUpdateDelayHidden
+		refreshIntervalForeground = Self.readDouble(forKey: Self.kRefreshForegroundKey, from: vSourceDict)
+			?? Self.kDefaultRefreshForeground
+		refreshIntervalBackground = Self.readDouble(forKey: Self.kRefreshBackgroundKey, from: vSourceDict)
+			?? Self.kDefaultRefreshBackground
 	}
 
 	// ===========================
@@ -127,6 +178,11 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 	private static func readBool(forKey inKey: String, from inDict: [String: Any]?) -> Bool? {
 		if let vDict = inDict { return vDict[inKey] as? Bool }
 		return UserDefaults.standard.object(forKey: inKey) as? Bool
+	}
+	// reads a number from either the supplied plist dict or UserDefaults
+	private static func readDouble(forKey inKey: String, from inDict: [String: Any]?) -> Double? {
+		if let vDict = inDict { return (vDict[inKey] as? NSNumber)?.doubleValue }
+		return (UserDefaults.standard.object(forKey: inKey) as? NSNumber)?.doubleValue
 	}
 	// reads a string from either the supplied plist dict or UserDefaults
 	private static func readString(forKey inKey: String, from inDict: [String: Any]?) -> String? {

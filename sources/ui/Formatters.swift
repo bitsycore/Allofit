@@ -6,6 +6,7 @@ import Foundation
 // them per row render, which would be expensive at thousands of rows.
 enum Formatters {
 
+	// file-size formatter (decimal units, like Finder)
 	private static let kSizeFormatter: ByteCountFormatter = {
 		let vF = ByteCountFormatter()
 		vF.countStyle = .file
@@ -17,11 +18,24 @@ enum Formatters {
 		return kSizeFormatter.string(fromByteCount: inBytes)
 	}
 
+	// memory formatter (binary units, like Activity Monitor)
+	private static let kMemoryFormatter: ByteCountFormatter = {
+		let vF = ByteCountFormatter()
+		vF.countStyle = .memory
+		return vF
+	}()
+
+	// memory amount, e.g. "312 MB" (binary units, like Activity Monitor)
+	static func memory(bytes inBytes: UInt64) -> String {
+		return kMemoryFormatter.string(fromByteCount: Int64(clamping: inBytes))
+	}
+
 	// same as size(bytes:), but "-" for zero / unknown (missing files)
 	static func sizeOrDash(bytes inBytes: Int64) -> String {
 		return inBytes <= 0 ? "-" : size(bytes: inBytes)
 	}
 
+	// short date + short time, in the user's locale
 	private static let kDateFormatter: DateFormatter = {
 		let vF = DateFormatter()
 		vF.dateStyle = .short

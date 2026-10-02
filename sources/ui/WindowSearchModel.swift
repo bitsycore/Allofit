@@ -31,8 +31,9 @@ final class WindowSearchModel: ObservableObject {
 	}
 	// the filtered, sorted and capped records currently shown in the table
 	@Published private(set) var visibleRecords: [FileRecord] = []
-	// total number of records matching the query (may exceed visibleRecords)
-	@Published private(set) var matchCount: Int = 0
+	// match count and timing for the status bar (observed separately so
+	// their updates don't re-render the table)
+	let stats = SearchStats()
 
 	// strong ref to the shared index; the per-window WindowSearchModel does
 	// not outlive its window, so the shared model has a longer lifetime
@@ -48,10 +49,6 @@ final class WindowSearchModel: ObservableObject {
 	private let kTypingDebounceSeconds: Double = 0.04
 	// delay after an index change: merges bursts of FSEvents updates
 	private let kIndexDebounceSeconds: Double = 0.3
-	// minimum gap between two refilters caused by index changes. Typing
-	// is unaffected; this caps the cost of an expensive query left open
-	// while files change constantly.
-	private let kIndexRefreshSeconds: Double = 1.0
 	// true while this model's window is on screen (not closed, minimized
 	// or fully covered)
 	private var isWindowVisible = true
@@ -90,7 +87,7 @@ final class WindowSearchModel: ObservableObject {
 	}
 
 	// throttled reaction to an index change: nothing while off screen,
-	// otherwise at most one refilter per kIndexRefreshSeconds. The
+	// otherwise at most one refilter per refresh interval. The
 	// refilter reads the newest records when it runs, so skipped
 	// notifications lose nothing.
 	private func indexDidChange() {
@@ -101,7 +98,14 @@ final class WindowSearchModel: ObservableObject {
 		if isIndexRefreshScheduled { return }
 		isIndexRefreshScheduled = true
 		let vSinceLast = Date().timeIntervalSince(lastIndexRefreshAt)
-		let vWait = max(kIndexDebounceSeconds, kIndexRefreshSeconds - vSinceLast)
+		// minimum gap between two index-driven refilters (Settings >
+		// Performance). Typing is unaffected; this caps the cost of an
+		// expensive query left open while files change constantly.
+		let vPrefs = Preferences.shared
+		let vInterval = AppActivity.shared.level == .foreground
+			? vPrefs.refreshIntervalForeground
+			: vPrefs.refreshIntervalBackground
+		let vWait = max(kIndexDebounceSeconds, vInterval - vSinceLast)
 		DispatchQueue.main.asyncAfter(deadline: .now() + vWait) { [weak self] in
 			guard let vSelf = self else { return }
 			vSelf.isIndexRefreshScheduled = false
@@ -130,6 +134,7 @@ final class WindowSearchModel: ObservableObject {
 				try? await Task.sleep(nanoseconds: vDelayNanos)
 			}
 			if Task.isCancelled { return }
+			let vStartedAt = DispatchTime.now()
 			let vEngine = SearchEngine(inQuery: vQuery)
 			// the chunks run on GCD worker threads, which can't see this
 			// task's cancellation - relay it through a shared flag
@@ -153,13 +158,15 @@ final class WindowSearchModel: ObservableObject {
 			)
 			if Task.isCancelled { return }
 			let vCount = vPositions.count
+			let vMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - vStartedAt.uptimeNanoseconds) / 1_000_000
 			// hop back to main with DispatchQueue.main.async (rather than
 			// await MainActor.run) so the assignment is guaranteed to land
 			// on the next runloop tick, avoiding NSTableView reentrance when
 			// the search field is mid-edit
 			DispatchQueue.main.async {
 				guard let vSelf = self else { return }
-				if vSelf.matchCount != vCount { vSelf.matchCount = vCount }
+				if vSelf.stats.matchCount != vCount { vSelf.stats.matchCount = vCount }
+				vSelf.stats.lastSearchMilliseconds = vMilliseconds
 				// Skip the @Published fire when the resulting list is
 				// identical to what the Table is already showing. Full
 				// FileRecord equality catches mtime / size updates, so we

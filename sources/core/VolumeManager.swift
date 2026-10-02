@@ -49,15 +49,15 @@ enum VolumeManager {
 
 	// returns the effective root URLs combining configured paths and mounted
 	// volumes that match the include-mounted / include-network preferences.
-	// Paths are standardized and nested roots dropped (a root inside another
+	// Paths are canonicalized and nested roots dropped (a root inside another
 	// root would otherwise be walked, watched and indexed twice).
 	static func effectiveRoots(inPreferences: Preferences) -> [URL] {
-		var vPaths: [String] = inPreferences.rootPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+		var vPaths: [String] = inPreferences.rootPaths.map { canonicalPath(inPath: $0) }
 		if inPreferences.includeMountedVolumes || inPreferences.includeNetworkVolumes {
 			for vVol in mountedVolumes() {
 				if vVol.isNetwork && !inPreferences.includeNetworkVolumes { continue }
 				if !vVol.isNetwork && !inPreferences.includeMountedVolumes { continue }
-				vPaths.append(vVol.url.standardizedFileURL.path)
+				vPaths.append(canonicalPath(inPath: vVol.url.path))
 			}
 		}
 		let vMinimal = Set(SubtreeMatcher.minimalRoots(inPaths: vPaths))
@@ -66,5 +66,19 @@ enum VolumeManager {
 		return vPaths
 			.filter { vMinimal.contains($0) && vSeen.insert($0).inserted }
 			.map { URL(fileURLWithPath: $0) }
+	}
+
+	// the path the kernel reports for inPath (symlinks resolved, e.g.
+	// /tmp -> /private/tmp), which is what FSEvents and the walker produce.
+	// Foundation's standardizedFileURL / resolvingSymlinksInPath strip the
+	// /private prefix instead, so a root under /tmp, /var or /etc would never
+	// match its own entries. Falls back to the given path (minus a trailing
+	// slash) when it doesn't exist, e.g. an unmounted volume.
+	static func canonicalPath(inPath: String) -> String {
+		if let vResolved = realpath(inPath, nil) {
+			defer { free(vResolved) }
+			return String(cString: vResolved)
+		}
+		return URL(fileURLWithPath: inPath).path
 	}
 }

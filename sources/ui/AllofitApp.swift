@@ -166,7 +166,7 @@ struct WindowVisibilityReporter: NSViewRepresentable {
 				observer = nil
 			}
 			guard let vWindow = window else {
-				onChange?(false)
+				report(false)
 				return
 			}
 			observer = NotificationCenter.default.addObserver(
@@ -176,16 +176,27 @@ struct WindowVisibilityReporter: NSViewRepresentable {
 			) { [weak self, weak vWindow] _ in
 				guard let vWin = vWindow else { return }
 				MainActor.assumeIsolated {
-					self?.onChange?(vWin.occlusionState.contains(.visible))
+					self?.report(vWin.occlusionState.contains(.visible))
 				}
 			}
-			onChange?(vWindow.occlusionState.contains(.visible))
+			report(vWindow.occlusionState.contains(.visible))
 		}
 
-		// removes the occlusion observer
+		// forwards a visibility change to the owner and the app-wide tracker
+		private func report(_ inVisible: Bool) {
+			onChange?(inVisible)
+			AppActivity.shared.setWindow(ObjectIdentifier(self), visible: inVisible)
+		}
+
+		// removes the occlusion observer; a destroyed window no longer
+		// counts as visible
 		deinit {
 			if let vObserver = observer {
 				NotificationCenter.default.removeObserver(vObserver)
+			}
+			let vId = ObjectIdentifier(self)
+			DispatchQueue.main.async {
+				AppActivity.shared.setWindow(vId, visible: false)
 			}
 		}
 	}

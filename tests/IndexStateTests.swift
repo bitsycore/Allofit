@@ -153,6 +153,13 @@ struct IndexStateTests {
 		#expect(Self.paths(vState) == ["/r", "/r/a", "/r/a/fresh.txt", "/r/c.txt"])
 	}
 
+	@Test func rootsAreCanonicalized() {
+		// /tmp is a symlink: FSEvents and the walker report /private/tmp
+		#expect(VolumeManager.canonicalPath(inPath: "/tmp") == "/private/tmp")
+		#expect(VolumeManager.canonicalPath(inPath: "/Users/") == "/Users")
+		#expect(VolumeManager.canonicalPath(inPath: "/no/such/root/") == "/no/such/root")
+	}
+
 	@Test func minimalRootsDropsNestedPaths() {
 		let vRoots = SubtreeMatcher.minimalRoots(inPaths: ["/a/b", "/a", "/a b/c", "/a", "/c"])
 		#expect(vRoots.sorted() == ["/a", "/a b/c", "/c"])
