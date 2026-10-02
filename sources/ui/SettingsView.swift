@@ -1,9 +1,10 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
-// SettingsView is the multi-tab Preferences window. It exposes roots,
-// exclusions, mounted volume inclusion, update / refresh timings,
-// background service installation, and on-disk cache management.
+// SettingsView is the Preferences window, grouped like Everything's options:
+// General (app behavior), Indexes (what gets indexed), Performance (update
+// timings) and Advanced (background service, cache, diagnostics).
 struct SettingsView: View {
 
 	@EnvironmentObject var model: AppModel
@@ -11,23 +12,199 @@ struct SettingsView: View {
 
 	var body: some View {
 		TabView {
-			RootsTab()
-				.tabItem { Label("Roots", systemImage: "folder") }
-			ExclusionsTab()
-				.tabItem { Label("Exclusions", systemImage: "minus.circle") }
-			VolumesTab()
-				.tabItem { Label("Volumes", systemImage: "externaldrive") }
+			GeneralTab()
+				.tabItem { Label("General", systemImage: "gearshape") }
+			IndexesTab()
+				.tabItem { Label("Indexes", systemImage: "folder") }
 			PerformanceTab()
 				.tabItem { Label("Performance", systemImage: "speedometer") }
-			ServiceTab()
-				.tabItem { Label("Service", systemImage: "gearshape.2") }
-			CacheTab()
-				.tabItem { Label("Cache", systemImage: "internaldrive") }
-			DiagnosticsTab()
-				.tabItem { Label("Diagnostics", systemImage: "stethoscope") }
+			AdvancedTab()
+				.tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
 		}
-		.frame(width: 620, height: 480)
+		.frame(width: 620, height: 500)
 		.padding()
+	}
+}
+
+// ===========================
+// MARK: General tab
+// ===========================
+
+// GeneralTab holds the app-level behavior: menu bar icon, global shortcut,
+// start at login, and how results react to double-click / highlighting.
+private struct GeneralTab: View {
+
+	@EnvironmentObject var prefs: Preferences
+	// availability of the chosen global shortcut
+	@ObservedObject private var hotKey = GlobalHotKey.shared
+	// current login item state, read from the system
+	@State private var loginStatus = SMAppService.mainApp.status
+	// last error from registering the login item
+	@State private var loginError: String?
+
+	var body: some View {
+		// plain sections like the other tabs: a .grouped Form drew hairline
+		// panel borders at fractional positions that flickered on refresh
+		VStack(alignment: .leading, spacing: 12) {
+			Text("Access")
+				.font(.headline)
+			Form {
+				// checkboxes get a left-column label like the pickers, so every
+				// control starts on the same vertical line
+				LabeledContent("Menu bar:") {
+					Toggle("Show Allofit in the menu bar", isOn: $prefs.showMenuBarIcon)
+				}
+				Picker("Global shortcut:", selection: $prefs.globalHotKey) {
+					ForEach(HotKeyPreset.allCases) { vPreset in
+						Text(vPreset.title).tag(vPreset)
+					}
+				}
+				.frame(maxWidth: 260)
+				if !hotKey.isAvailable {
+					Text("This shortcut is already used by another app. Pick another one.")
+						.font(.caption)
+						.foregroundColor(.orange)
+				}
+				LabeledContent("Login:") {
+					Toggle("Start Allofit at login", isOn: loginBinding)
+				}
+				if loginStatus == .requiresApproval {
+					HStack {
+						Text("Approve Allofit in System Settings > General > Login Items.")
+							.font(.caption)
+							.foregroundColor(.orange)
+						Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+							.controlSize(.small)
+					}
+				}
+				if let vError = loginError {
+					Text(vError)
+						.font(.caption)
+						.foregroundColor(.red)
+				}
+			}
+
+			Divider()
+
+			Text("Results")
+				.font(.headline)
+			Form {
+				Picker("Double-click or Return:", selection: $prefs.primaryAction) {
+					Text("Opens the file").tag(Preferences.PrimaryAction.open)
+					Text("Reveals it in Finder").tag(Preferences.PrimaryAction.reveal)
+				}
+				.frame(maxWidth: 360)
+				LabeledContent("Highlighting:") {
+					Toggle("Highlight matches in names and paths", isOn: $prefs.highlightMatches)
+				}
+			}
+
+			Divider()
+
+			Text("Finder")
+				.font(.headline)
+			Text("Right-click a folder in Finder and choose Quick Actions (or Services) > Search in Allofit to search inside it. Dropping a folder on the Dock icon does the same.")
+				.font(.caption)
+				.foregroundColor(.secondary)
+				.fixedSize(horizontal: false, vertical: true)
+			Spacer()
+		}
+		.onAppear { loginStatus = SMAppService.mainApp.status }
+	}
+
+	// registers / unregisters the app as a login item
+	private var loginBinding: Binding<Bool> {
+		Binding(
+			get: { loginStatus == .enabled || loginStatus == .requiresApproval },
+			set: { vEnabled in
+				do {
+					if vEnabled {
+						try SMAppService.mainApp.register()
+					} else {
+						try SMAppService.mainApp.unregister()
+					}
+					loginError = nil
+				} catch {
+					loginError = "Couldn't change the login item: \(error.localizedDescription)"
+				}
+				loginStatus = SMAppService.mainApp.status
+			}
+		)
+	}
+}
+
+// ===========================
+// MARK: Grouping tabs
+// ===========================
+
+// IndexesTab groups what gets indexed: root folders, exclusions, volumes
+private struct IndexesTab: View {
+
+	// sections of the tab
+	private enum Section: String, CaseIterable, Identifiable {
+		case folders = "Folders"
+		case exclusions = "Exclusions"
+		case volumes = "Volumes"
+		var id: String { rawValue }
+	}
+
+	// section currently shown
+	@State private var section: Section = .folders
+
+	var body: some View {
+		VStack(alignment: .leading, spacing: 12) {
+			Picker("", selection: $section) {
+				ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
+			}
+			.pickerStyle(.segmented)
+			.labelsHidden()
+			// pinned to the top so every section starts right below the
+			// picker (a section without a trailing Spacer would otherwise
+			// be centered vertically)
+			Group {
+				switch section {
+					case .folders: RootsTab()
+					case .exclusions: ExclusionsTab()
+					case .volumes: VolumesTab()
+				}
+			}
+			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+		}
+	}
+}
+
+// AdvancedTab groups the power-user pages: background service, cache file
+// and live diagnostics
+private struct AdvancedTab: View {
+
+	// sections of the tab
+	private enum Section: String, CaseIterable, Identifiable {
+		case service = "Service"
+		case cache = "Cache"
+		case diagnostics = "Diagnostics"
+		var id: String { rawValue }
+	}
+
+	// section currently shown
+	@State private var section: Section = .service
+
+	var body: some View {
+		VStack(alignment: .leading, spacing: 12) {
+			Picker("", selection: $section) {
+				ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
+			}
+			.pickerStyle(.segmented)
+			.labelsHidden()
+			// pinned to the top, see IndexesTab
+			Group {
+				switch section {
+					case .service: ServiceTab()
+					case .cache: CacheTab()
+					case .diagnostics: DiagnosticsTab()
+				}
+			}
+			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+		}
 	}
 }
 

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 // AllofitApp is the SwiftUI App for the GUI mode. The real entry point lives
 // in Main.swift, which routes between this and the headless --service mode.
@@ -30,10 +31,12 @@ struct AllofitApp: App {
 				Button("About Allofit") { showAboutPanel() }
 			}
 			CommandGroup(after: .appInfo) {
-				Button("Reindex All") {
+				// ⇧⌘R rather than ⌘R: a full rebuild is too costly to trigger
+				// by accident
+				Button("Rebuild Index") {
 					Task { await model.performReindex() }
 				}
-				.keyboardShortcut("r", modifiers: [.command])
+				.keyboardShortcut("r", modifiers: [.command, .shift])
 			}
 			// SwiftUI provides File > New Window (⌘N) automatically for a
 			// WindowGroup; nothing to add here. Additional windows share the
@@ -246,6 +249,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// nonisolated(unsafe) because all reads/writes happen on the main thread
 	// (NSView callbacks + the AppKit delegate methods are all @MainActor).
 	nonisolated(unsafe) static var mainWindow: NSWindow?
+	// keeps the global-shortcut setting subscription alive
+	private var hotKeySubscription: AnyCancellable?
+	// keeps the menu-bar-icon setting subscription alive
+	private var menuBarSubscription: AnyCancellable?
+	// the menu bar icon, nil while hidden
+	private var statusItem: NSStatusItem?
 
 	// called once when the application has finished launching
 	func applicationDidFinishLaunching(_ inNotification: Notification) {
@@ -262,6 +271,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// run so a crash or hard-kill doesn't accumulate privileged copies
 		// in ~/Library/Caches across sessions
 		ElevatedAccess.cleanup()
+		// Finder > Services > "Search in Allofit"
+		NSApp.servicesProvider = ServicesProvider()
+		NSUpdateDynamicServices()
+		// system-wide shortcut, re-registered whenever the setting changes
+		GlobalHotKey.shared.onPressed = { WindowPresenter.toggle() }
+		hotKeySubscription = Preferences.shared.$globalHotKey
+			.removeDuplicates()
+			.sink { vPreset in
+				MainActor.assumeIsolated {
+					_ = GlobalHotKey.shared.register(inPreset: vPreset)
+				}
+			}
+		// menu bar icon (Everything's tray icon), shown per the setting.
+		// Plain AppKit: a SwiftUI MenuBarExtra scene crashed the app at
+		// launch (runtime recursion resolving the App's scene type).
+		menuBarSubscription = Preferences.shared.$showMenuBarIcon
+			.removeDuplicates()
+			.sink { [weak self] vShow in
+				MainActor.assumeIsolated {
+					self?.setStatusItemVisible(vShow)
+				}
+			}
 		// bring the main window to the front so it accepts keystrokes
 		DispatchQueue.main.async {
 			for vWindow in NSApp.windows where vWindow.canBecomeKey {
@@ -304,18 +335,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// action. We match on the keyboard shortcut rather than the title so the
 	// lookup survives localized menus.
 	@objc func newWindowFromDock(_ inSender: Any?) {
-		guard let vMain = NSApp.mainMenu else { return }
-		for vTop in vMain.items {
-			guard let vSub = vTop.submenu else { continue }
-			for vItem in vSub.items {
-				if vItem.keyEquivalent == "n",
-				   vItem.keyEquivalentModifierMask == [.command],
-				   let vAction = vItem.action {
-					NSApp.sendAction(vAction, to: vItem.target, from: nil)
-					return
-				}
-			}
+		MainActor.assumeIsolated {
+			WindowPresenter.openNewWindow()
 		}
+	}
+
+	// adds or removes the menu bar icon and its menu
+	private func setStatusItemVisible(_ inVisible: Bool) {
+		guard inVisible else {
+			if let vItem = statusItem {
+				NSStatusBar.system.removeStatusItem(vItem)
+				statusItem = nil
+			}
+			return
+		}
+		guard statusItem == nil else { return }
+		let vItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+		vItem.button?.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Allofit")
+		let vMenu = NSMenu()
+		vMenu.addItem(withTitle: "Show Allofit", action: #selector(statusShow(_:)), keyEquivalent: "").target = self
+		vMenu.addItem(.separator())
+		vMenu.addItem(withTitle: "Settings…", action: #selector(statusSettings(_:)), keyEquivalent: "").target = self
+		vMenu.addItem(.separator())
+		vMenu.addItem(withTitle: "Quit Allofit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+		vItem.menu = vMenu
+		statusItem = vItem
+	}
+
+	// menu bar > Show Allofit
+	@objc private func statusShow(_ inSender: Any?) {
+		MainActor.assumeIsolated {
+			WindowPresenter.show()
+		}
+	}
+
+	// menu bar > Settings…
+	@objc private func statusSettings(_ inSender: Any?) {
+		NSApp.activate(ignoringOtherApps: true)
+		NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+	}
+
+	// folders dropped on the Dock icon or opened with the app
+	// (open -a Allofit <folder>) start a search inside that folder
+	func application(_ inApplication: NSApplication, open inUrls: [URL]) {
+		guard let vFirst = inUrls.first else { return }
+		let vIsDir = (try? vFirst.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+		WindowPresenter.search(inFolder: vIsDir ? vFirst.path : vFirst.deletingLastPathComponent().path)
 	}
 
 	// dock-icon click while no windows are visible: re-show only the main

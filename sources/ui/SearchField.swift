@@ -53,6 +53,14 @@ struct SearchField: NSViewRepresentable {
 		vField.searchMenuTemplate = vMenu
 
 		inContext.coordinator.field = vField
+		// a query sent from outside before this window existed
+		if let vPending = WindowPresenter.pendingQuery {
+			WindowPresenter.pendingQuery = nil
+			vField.stringValue = vPending
+			DispatchQueue.main.async {
+				inContext.coordinator.parent.text = vPending
+			}
+		}
 
 		if initiallyFirstResponder {
 			DispatchQueue.main.async {
@@ -108,6 +116,14 @@ struct SearchField: NSViewRepresentable {
 				name: .allofitFocusSearch,
 				object: nil
 			)
+			// queries sent from outside (Finder service, folder dropped on
+			// the Dock icon) replace the text of the key window's field
+			NotificationCenter.default.addObserver(
+				self,
+				selector: #selector(handleSetQuery(_:)),
+				name: .allofitSetQuery,
+				object: nil
+			)
 		}
 
 		// stops listening for the Find shortcut
@@ -124,6 +140,18 @@ struct SearchField: NSViewRepresentable {
 			guard let vField = field, vField.window?.isKeyWindow == true else { return }
 			vField.window?.makeFirstResponder(vField)
 			vField.selectText(nil)
+		}
+
+		// puts an external query in the key window's field, caret at the end
+		// so the user can keep typing more terms
+		@objc private func handleSetQuery(_ inNotification: Notification) {
+			guard let vQuery = inNotification.object as? String,
+				  let vField = field, vField.window?.isKeyWindow == true else { return }
+			WindowPresenter.pendingQuery = nil
+			vField.stringValue = vQuery
+			parent.text = vQuery
+			vField.window?.makeFirstResponder(vField)
+			vField.currentEditor()?.selectedRange = NSRange(location: (vQuery as NSString).length, length: 0)
 		}
 
 		// fired on every keystroke; reset navigation and push text to SwiftUI

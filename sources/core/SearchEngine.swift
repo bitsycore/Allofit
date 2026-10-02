@@ -46,6 +46,18 @@ struct SearchEngine: Sendable {
 		let requiresDirectory: Bool?
 		// true when the term was prefixed with "!"
 		let negated: Bool
+		// the term's text as typed (no "!" / modifier prefix), used to
+		// emphasize matches in the results; empty for ext: and bare modifiers
+		var text: String = ""
+	}
+
+	// literal pieces of the query to emphasize in the results, matched
+	// case- and accent-insensitively against the displayed name / folder
+	struct Highlights: Equatable, Sendable {
+		// pieces to emphasize in names
+		var name: [String] = []
+		// pieces to emphasize in folder paths
+		var path: [String] = []
 	}
 
 	// AND of OR-groups: every group must have at least one matching term
@@ -77,6 +89,25 @@ struct SearchEngine: Sendable {
 
 	// true when this engine has any pattern that will filter results
 	var isActive: Bool { !groups.isEmpty }
+
+	// what to emphasize in the results: the literal runs of every positive
+	// name / path term (wildcards and folder separators split the runs)
+	var highlights: Highlights {
+		var vResult = Highlights()
+		for vTerm in groups.joined() where !vTerm.negated && !vTerm.text.isEmpty {
+			let vSeparators: Set<Character> = vTerm.matchesPath ? ["*", "?", "/"] : ["*", "?"]
+			let vPieces = vTerm.text
+				.split(whereSeparator: { vSeparators.contains($0) })
+				.map(String.init)
+				.filter { !$0.isEmpty }
+			if vTerm.matchesPath {
+				vResult.path.append(contentsOf: vPieces)
+			} else {
+				vResult.name.append(contentsOf: vPieces)
+			}
+		}
+		return vResult
+	}
 
 	// returns true if the record satisfies every AND-group of the query
 	func match(inRecord: FileRecord) -> Bool {
@@ -179,7 +210,8 @@ struct SearchEngine: Sendable {
 			pattern: vPattern,
 			matchesPath: vIsPath,
 			requiresDirectory: vRequiresDir,
-			negated: vNegated
+			negated: vNegated,
+			text: String(vText)
 		)
 	}
 

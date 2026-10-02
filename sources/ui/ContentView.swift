@@ -105,7 +105,7 @@ struct ContentView: View {
 			resultsTable
 			Divider()
 			// isolated so its refreshes don't re-evaluate the Table closure
-			StatusBarView(stats: searchModel.stats)
+			StatusBarView(stats: searchModel.stats, selectionText: selectionSummary)
 		}
 	}
 
@@ -137,12 +137,24 @@ struct ContentView: View {
 	// ===========================
 
 	private var searchBar: some View {
-		SearchField(
-			text: $searchModel.query,
-			placeholder: "Search files…  e.g.  Start*.pdf  ·  *.png | *.jpg",
-			initiallyFirstResponder: true
-		)
-		.frame(minHeight: 24)
+		HStack(spacing: 8) {
+			SearchField(
+				text: $searchModel.query,
+				placeholder: "Search files…  e.g.  Start*.pdf  ·  *.png | *.jpg",
+				initiallyFirstResponder: true
+			)
+			.frame(minHeight: 24)
+			// Everything-style category filter, ANDed with the query
+			Picker("Filter", selection: $searchModel.filter) {
+				ForEach(SearchFilter.allCases) { vFilter in
+					Label(vFilter.title, systemImage: vFilter.symbolName).tag(vFilter)
+				}
+			}
+			.labelsHidden()
+			.pickerStyle(.menu)
+			.fixedSize()
+			.help("Show only one kind of item")
+		}
 		.padding(.horizontal, 12)
 		.padding(.vertical, 8)
 		.background(.bar)
@@ -170,7 +182,7 @@ struct ContentView: View {
 					))
 					.resizable()
 					.frame(width: 16, height: 16)
-					Text(vRecord.name)
+					Text(nameText(for: vRecord))
 						.lineLimit(1)
 						.help(vRecord.name)
 					// When the preview pane is closed, surface the
@@ -196,7 +208,7 @@ struct ContentView: View {
 			.customizationID("name")
 
 			TableColumn("Path", value: \FileRecord.parentPath) { vRecord in
-				Text(vRecord.parentPath)
+				Text(pathText(for: vRecord))
 					.foregroundColor(.secondary)
 					.truncationMode(.middle)
 					.lineLimit(1)
@@ -239,12 +251,26 @@ struct ContentView: View {
 		}
 		.contextMenu(forSelectionType: FileRecord.ID.self) { vIds in
 			Button("Open") { openSelection(inIds: vIds) }
+			openWithMenu(inIds: vIds)
 			Button("Reveal in Finder") { revealSelection(inIds: vIds) }
 			Button("Quick Look") { quickLookSelection(inIds: vIds) }
 			Divider()
+			Button("Copy") { copyFiles(inIds: vIds) }
+			Button("Copy Name") { copyNames(inIds: vIds) }
 			Button("Copy Path") { copyPaths(inIds: vIds) }
+			Divider()
+			Button("Move to Trash") { trashSelection(inIds: vIds) }
 		} primaryAction: { vIds in
-			openSelection(inIds: vIds)
+			runPrimaryAction(inIds: vIds)
+		}
+		// ⌘C on the table copies the files themselves (like Finder); in the
+		// search field ⌘C keeps copying text
+		.onCopyCommand {
+			recordsFor(inIds: selection).map { ContentView.fileDragProvider(for: $0) }
+		}
+		// Finder-style shortcuts, active while the table has focus
+		.onKeyPress(phases: .down) { vPress in
+			handleTableKey(inPress: vPress)
 		}
 		// Finder-style spacebar Quick Look. .onKeyPress only fires when the
 		// view (Table) has keyboard focus, so spaces typed into the search
@@ -268,6 +294,57 @@ struct ContentView: View {
 		let vProvider = NSItemProvider(object: URL(fileURLWithPath: inRecord.fullPath) as NSURL)
 		vProvider.suggestedName = inRecord.name
 		return vProvider
+	}
+
+	// ===========================
+	// MARK: Highlighting
+	// ===========================
+
+	// the name with the matched parts in bold (when enabled in Settings)
+	private func nameText(for inRecord: FileRecord) -> AttributedString {
+		guard prefs.highlightMatches else { return AttributedString(inRecord.name) }
+		return Highlighter.attributed(inRecord.name, inTerms: searchModel.highlights.name)
+	}
+
+	// the folder with the matched parts of path terms in bold
+	private func pathText(for inRecord: FileRecord) -> AttributedString {
+		guard prefs.highlightMatches else { return AttributedString(inRecord.parentPath) }
+		return Highlighter.attributed(inRecord.parentPath, inTerms: searchModel.highlights.path)
+	}
+
+	// ===========================
+	// MARK: Keyboard
+	// ===========================
+
+	// Finder-style shortcuts for the table: Return runs the primary action,
+	// ⌘Return reveals, ⌘Y previews, ⌥⌘C copies paths, ⌘⌫ moves to Trash
+	private func handleTableKey(inPress: KeyPress) -> KeyPress.Result {
+		guard !selection.isEmpty else { return .ignored }
+		let vMods = inPress.modifiers.intersection([.command, .option, .shift, .control])
+		switch (inPress.key, vMods) {
+			case (.return, []):
+				runPrimaryAction(inIds: selection)
+			case (.return, [.command]):
+				revealSelection(inIds: selection)
+			case (KeyEquivalent("y"), [.command]):
+				quickLookSelection(inIds: selection)
+			case (KeyEquivalent("c"), [.command, .option]):
+				copyPaths(inIds: selection)
+			case (.delete, [.command]):
+				trashSelection(inIds: selection)
+			default:
+				return .ignored
+		}
+		return .handled
+	}
+
+	// "3 selected (12 MB)" for the status bar, nil without a selection
+	private var selectionSummary: String? {
+		guard !selection.isEmpty else { return nil }
+		let vRecords = recordsFor(inIds: selection)
+		let vBytes = vRecords.filter { !$0.isDirectory }.reduce(Int64(0)) { $0 + $1.size }
+		let vCount = "\(vRecords.count.formatted()) selected"
+		return vBytes > 0 ? "\(vCount) (\(Formatters.size(bytes: vBytes)))" : vCount
 	}
 
 	// ===========================
@@ -297,6 +374,68 @@ struct ContentView: View {
 		let vPaths = recordsFor(inIds: inIds).map { $0.fullPath }
 		NSPasteboard.general.clearContents()
 		NSPasteboard.general.setString(vPaths.joined(separator: "\n"), forType: .string)
+	}
+
+	// double-click / Return: open or reveal, as chosen in Settings
+	private func runPrimaryAction(inIds: Set<FileRecord.ID>) {
+		switch prefs.primaryAction {
+			case .open: openSelection(inIds: inIds)
+			case .reveal: revealSelection(inIds: inIds)
+		}
+	}
+
+	// "Open With" submenu listing the apps that can open the first selected
+	// file, default app first
+	@ViewBuilder
+	private func openWithMenu(inIds: Set<FileRecord.ID>) -> some View {
+		if let vFirst = recordsFor(inIds: inIds).first {
+			let vUrl = URL(fileURLWithPath: vFirst.fullPath)
+			let vDefault = NSWorkspace.shared.urlForApplication(toOpen: vUrl)
+			let vApps = [vDefault].compactMap { $0 }
+				+ NSWorkspace.shared.urlsForApplications(toOpen: vUrl).filter { $0 != vDefault }
+			Menu("Open With") {
+				ForEach(vApps, id: \.self) { vApp in
+					Button(FileManager.default.displayName(atPath: vApp.path) + (vApp == vDefault ? " (default)" : "")) {
+						openSelection(inIds: inIds, withApp: vApp)
+					}
+				}
+			}
+			.disabled(vApps.isEmpty)
+		}
+	}
+
+	// opens the selected files with a specific app
+	private func openSelection(inIds: Set<FileRecord.ID>, withApp inApp: URL) {
+		let vUrls = recordsFor(inIds: inIds).map { access.effectiveURL(for: $0) }
+		NSWorkspace.shared.open(vUrls, withApplicationAt: inApp, configuration: NSWorkspace.OpenConfiguration())
+	}
+
+	// copies the selected files themselves (paste in Finder copies them)
+	private func copyFiles(inIds: Set<FileRecord.ID>) {
+		let vUrls = recordsFor(inIds: inIds).map { URL(fileURLWithPath: $0.fullPath) as NSURL }
+		NSPasteboard.general.clearContents()
+		NSPasteboard.general.writeObjects(vUrls)
+	}
+
+	// copies the selected names, one per line
+	private func copyNames(inIds: Set<FileRecord.ID>) {
+		let vNames = recordsFor(inIds: inIds).map { $0.name }
+		NSPasteboard.general.clearContents()
+		NSPasteboard.general.setString(vNames.joined(separator: "\n"), forType: .string)
+	}
+
+	// moves the selected files to the Trash and drops their rows at once
+	private func trashSelection(inIds: Set<FileRecord.ID>) {
+		let vRecords = recordsFor(inIds: inIds)
+		let vUrls = vRecords.map { URL(fileURLWithPath: $0.fullPath) }
+		NSWorkspace.shared.recycle(vUrls) { vTrashed, _ in
+			let vGone = Set(vRecords.filter { vTrashed[URL(fileURLWithPath: $0.fullPath)] != nil }.map(\.id))
+			guard !vGone.isEmpty else { return }
+			DispatchQueue.main.async {
+				searchModel.removeVisible(inIds: vGone)
+				selection.subtract(vGone)
+			}
+		}
 	}
 
 	// opens the selected files with their default app
@@ -361,6 +500,8 @@ private struct StatusBarView: View {
 	@EnvironmentObject var searchModel: WindowSearchModel
 	// per-window match count and search time
 	@ObservedObject var stats: SearchStats
+	// "3 selected (12 MB)", nil without a selection
+	let selectionText: String?
 	// process memory / CPU sampler shared by all windows
 	@ObservedObject private var process = ProcessStats.shared
 
@@ -379,6 +520,10 @@ private struct StatusBarView: View {
 				Text("Indexing…  \(model.indexedCount.formatted()) entries")
 			} else {
 				Text(resultsText)
+				if let vSelection = selectionText {
+					Text("·")
+					Text(vSelection)
+				}
 			}
 			Spacer()
 			HStack(spacing: 6) {

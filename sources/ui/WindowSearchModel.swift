@@ -29,8 +29,14 @@ final class WindowSearchModel: ObservableObject {
 			scheduleFilter(inDelay: kTypingDebounceSeconds)
 		}
 	}
+	// the category filter chosen in the menu next to the search field
+	@Published var filter: SearchFilter = .everything {
+		didSet { scheduleFilter(inDelay: kTypingDebounceSeconds) }
+	}
 	// the filtered, sorted and capped records currently shown in the table
 	@Published private(set) var visibleRecords: [FileRecord] = []
+	// what to emphasize in the shown results (always matches visibleRecords)
+	@Published private(set) var highlights = SearchEngine.Highlights()
 	// match count and timing for the status bar (observed separately so
 	// their updates don't re-render the table)
 	let stats = SearchStats()
@@ -86,6 +92,13 @@ final class WindowSearchModel: ObservableObject {
 		}
 	}
 
+	// drops rows right away (e.g. after Move to Trash); the index catches up
+	// through FSEvents a moment later
+	func removeVisible(inIds: Set<FileRecord.ID>) {
+		visibleRecords.removeAll { inIds.contains($0.id) }
+		stats.matchCount = max(0, stats.matchCount - inIds.count)
+	}
+
 	// throttled reaction to an index change: nothing while off screen,
 	// otherwise at most one refilter per refresh interval. The
 	// refilter reads the newest records when it runs, so skipped
@@ -124,7 +137,8 @@ final class WindowSearchModel: ObservableObject {
 	private func scheduleFilter(inDelay: Double) {
 		filterTask?.cancel()
 		// snapshot inputs on main; the detached task is self-contained
-		let vQuery = query
+		let vQuery = filter.apply(toQuery: query)
+		let vHighlights = SearchEngine(inQuery: query).highlights
 		let vSort = sortDescriptor
 		let vRecords = model.allRecords
 		let vMax = kMaxVisibleRows
@@ -167,6 +181,7 @@ final class WindowSearchModel: ObservableObject {
 				guard let vSelf = self else { return }
 				if vSelf.stats.matchCount != vCount { vSelf.stats.matchCount = vCount }
 				vSelf.stats.lastSearchMilliseconds = vMilliseconds
+				if vSelf.highlights != vHighlights { vSelf.highlights = vHighlights }
 				// Skip the @Published fire when the resulting list is
 				// identical to what the Table is already showing. Full
 				// FileRecord equality catches mtime / size updates, so we

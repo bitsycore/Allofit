@@ -104,4 +104,19 @@ struct SearchEngineTests {
 		#expect(Self.matches("RÉSUMÉ", "/d/" + vDecomposed))
 		#expect(Self.matches("r?sum?.pdf", "/d/" + vDecomposed))
 	}
+
+	@Test func highlightsKeepLiteralRuns() {
+		let vHigh = SearchEngine(inQuery: "IMG_????.heic !draft \"some/folder/**/path\" ext:pdf").highlights
+		#expect(vHigh.name == ["IMG_", ".heic"])
+		#expect(vHigh.path == ["some", "folder", "path"])
+	}
+
+	@Test func filtersAreAndedWithTheQuery() {
+		#expect(Self.matches(SearchFilter.pictures.apply(toQuery: "img"), "/d/img_1.HEIC"))
+		#expect(!Self.matches(SearchFilter.pictures.apply(toQuery: "img"), "/d/img_1.txt"))
+		#expect(Self.matches(SearchFilter.folders.apply(toQuery: ""), "/d/src", isDirectory: true))
+		#expect(Self.matches(SearchFilter.applications.apply(toQuery: "xcode"), "/Applications/Xcode.app", isDirectory: true))
+		#expect(!Self.matches(SearchFilter.applications.apply(toQuery: "xcode"), "/d/xcode.app.zip"))
+		#expect(SearchFilter.everything.apply(toQuery: "a b") == "a b")
+	}
 }

@@ -64,6 +64,31 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		didSet { UserDefaults.standard.set(refreshIntervalBackground, forKey: Self.kRefreshBackgroundKey) }
 	}
 
+	// true to emphasize the matched parts of names and paths in the results
+	@Published var highlightMatches: Bool {
+		didSet { UserDefaults.standard.set(highlightMatches, forKey: Self.kHighlightMatchesKey) }
+	}
+	// what a double-click / Return on a result does
+	@Published var primaryAction: PrimaryAction {
+		didSet { UserDefaults.standard.set(primaryAction.rawValue, forKey: Self.kPrimaryActionKey) }
+	}
+
+	// true to show the Allofit icon in the menu bar
+	@Published var showMenuBarIcon: Bool {
+		didSet { UserDefaults.standard.set(showMenuBarIcon, forKey: Self.kShowMenuBarIconKey) }
+	}
+	// system-wide shortcut that shows / hides the main window
+	@Published var globalHotKey: HotKeyPreset {
+		didSet { UserDefaults.standard.set(globalHotKey.rawValue, forKey: Self.kGlobalHotKeyKey) }
+	}
+
+	// actions available for double-click / Return on a result
+	enum PrimaryAction: String, CaseIterable, Identifiable {
+		case open        // open with the default app
+		case reveal      // reveal in Finder
+		var id: String { rawValue }
+	}
+
 	// default values of the update / refresh timings, in seconds
 	static let kDefaultUpdateDelayForeground: Double = 2
 	static let kDefaultUpdateDelayBackground: Double = 15
@@ -94,6 +119,10 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 	private static let kNetworkKey = "Allofit.includeNetworkVolumes"
 	private static let kServiceModeKey = "Allofit.serviceMode"
 	private static let kLastSortKey = "Allofit.lastSort"
+	private static let kHighlightMatchesKey = "Allofit.highlightMatches"
+	private static let kShowMenuBarIconKey = "Allofit.showMenuBarIcon"
+	private static let kGlobalHotKeyKey = "Allofit.globalHotKey"
+	private static let kPrimaryActionKey = "Allofit.primaryAction"
 	private static let kUpdateDelayForegroundKey = "Allofit.updateDelayForeground"
 	private static let kUpdateDelayBackgroundKey = "Allofit.updateDelayBackground"
 	private static let kUpdateDelayHiddenKey = "Allofit.updateDelayHidden"
@@ -131,6 +160,12 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		} else {
 			lastSort = .nameAscending
 		}
+		highlightMatches = Self.readBool(forKey: Self.kHighlightMatchesKey, from: vSourceDict) ?? true
+		showMenuBarIcon = Self.readBool(forKey: Self.kShowMenuBarIconKey, from: vSourceDict) ?? true
+		globalHotKey = Self.readString(forKey: Self.kGlobalHotKeyKey, from: vSourceDict)
+			.flatMap(HotKeyPreset.init(rawValue:)) ?? .optionSpace
+		primaryAction = Self.readString(forKey: Self.kPrimaryActionKey, from: vSourceDict)
+			.flatMap(PrimaryAction.init(rawValue:)) ?? .open
 		updateDelayForeground = Self.readDouble(forKey: Self.kUpdateDelayForegroundKey, from: vSourceDict)
 			?? Self.kDefaultUpdateDelayForeground
 		updateDelayBackground = Self.readDouble(forKey: Self.kUpdateDelayBackgroundKey, from: vSourceDict)
