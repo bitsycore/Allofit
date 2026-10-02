@@ -39,10 +39,6 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 	@Published var serviceMode: ServiceMode {
 		didSet { UserDefaults.standard.set(serviceMode.rawValue, forKey: Self.kServiceModeKey) }
 	}
-	// last search query, restored on next launch
-	@Published var lastQuery: String {
-		didSet { UserDefaults.standard.set(lastQuery, forKey: Self.kLastQueryKey) }
-	}
 	// last sort descriptor used, restored on next launch
 	@Published var lastSort: FileSortDescriptor {
 		didSet { UserDefaults.standard.set(lastSort.rawValue, forKey: Self.kLastSortKey) }
@@ -61,7 +57,6 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 	private static let kMountedKey = "Allofit.includeMountedVolumes"
 	private static let kNetworkKey = "Allofit.includeNetworkVolumes"
 	private static let kServiceModeKey = "Allofit.serviceMode"
-	private static let kLastQueryKey = "Allofit.lastQuery"
 	private static let kLastSortKey = "Allofit.lastSort"
 
 	// flushes pending UserDefaults writes to disk so the daemon (which reads
@@ -70,6 +65,7 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		UserDefaults.standard.synchronize()
 	}
 
+	// loads every setting, from the owner's plist when running as the root daemon
 	private init() {
 		// When we are the root daemon, the standard UserDefaults points at
 		// /var/root/Library/Preferences/... which is *not* where the GUI user
@@ -88,7 +84,6 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		} else {
 			serviceMode = .none
 		}
-		lastQuery = Self.readString(forKey: Self.kLastQueryKey, from: vSourceDict) ?? ""
 		if let vRaw = Self.readString(forKey: Self.kLastSortKey, from: vSourceDict),
 		   let vSort = FileSortDescriptor(rawValue: vRaw) {
 			lastSort = vSort
@@ -153,6 +148,7 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 		return [FileManager.default.homeDirectoryForCurrentUser.path]
 	}
 
+	// default exclusions: system noise for the daemon, caches and trash for a user
 	private static func defaultExcludedPaths() -> [String] {
 		if ProcessInfo.processInfo.environment["ALLOFIT_SYSTEM_INDEX"] == "1" {
 			return [

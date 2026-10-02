@@ -17,17 +17,15 @@ struct SearchField: NSViewRepresentable {
 	@Binding var text: String
 	// placeholder shown when the field is empty
 	var placeholder: String = ""
-	// fired when the user presses Return inside the field
-	var onSubmit: (() -> Void)? = nil
 	// set true to grab keyboard focus when the field is first inserted
 	var initiallyFirstResponder: Bool = false
 
 	// builds and configures the underlying NSSearchField
-	func makeNSView(context: Context) -> NSSearchField {
+	func makeNSView(context inContext: Context) -> NSSearchField {
 		let vField = NSSearchField()
 		vField.placeholderString = placeholder
-		vField.delegate = context.coordinator
-		vField.target = context.coordinator
+		vField.delegate = inContext.coordinator
+		vField.target = inContext.coordinator
 		vField.action = #selector(Coordinator.actionTriggered(_:))
 		// keep filtering live as the user types
 		vField.sendsSearchStringImmediately = false
@@ -54,7 +52,7 @@ struct SearchField: NSViewRepresentable {
 		vMenu.addItem(vClear)
 		vField.searchMenuTemplate = vMenu
 
-		context.coordinator.field = vField
+		inContext.coordinator.field = vField
 
 		if initiallyFirstResponder {
 			DispatchQueue.main.async {
@@ -65,12 +63,13 @@ struct SearchField: NSViewRepresentable {
 	}
 
 	// keeps the NSSearchField's stringValue in sync with our binding
-	func updateNSView(_ nsView: NSSearchField, context: Context) {
-		if nsView.stringValue != text {
-			nsView.stringValue = text
+	func updateNSView(_ inView: NSSearchField, context inContext: Context) {
+		if inView.stringValue != text {
+			inView.stringValue = text
 		}
 	}
 
+	// creates the delegate bridging AppKit events to SwiftUI
 	func makeCoordinator() -> Coordinator {
 		return Coordinator(self)
 	}
@@ -97,6 +96,7 @@ struct SearchField: NSViewRepresentable {
 		// pending auto-save task; cancelled+rescheduled on every keystroke
 		private var autoSaveTask: Task<Void, Never>?
 
+		// binds to the SearchField and listens for the Find shortcut
 		init(_ inParent: SearchField) {
 			parent = inParent
 			super.init()
@@ -110,6 +110,7 @@ struct SearchField: NSViewRepresentable {
 			)
 		}
 
+		// stops listening for the Find shortcut
 		deinit {
 			NotificationCenter.default.removeObserver(self)
 		}
@@ -126,8 +127,8 @@ struct SearchField: NSViewRepresentable {
 		}
 
 		// fired on every keystroke; reset navigation and push text to SwiftUI
-		func controlTextDidChange(_ notification: Notification) {
-			guard let vField = notification.object as? NSSearchField else { return }
+		func controlTextDidChange(_ inNotification: Notification) {
+			guard let vField = inNotification.object as? NSSearchField else { return }
 			navigationIndex = nil
 			let vValue = vField.stringValue
 			if parent.text != vValue {
@@ -162,27 +163,26 @@ struct SearchField: NSViewRepresentable {
 		}
 
 		// NSSearchField's action target: fires on Return and on recent-pick
-		@objc func actionTriggered(_ sender: NSSearchField) {
-			if parent.text != sender.stringValue {
-				parent.text = sender.stringValue
+		@objc func actionTriggered(_ inSender: NSSearchField) {
+			if parent.text != inSender.stringValue {
+				parent.text = inSender.stringValue
 			}
-			parent.onSubmit?()
 		}
 
 		// intercept arrow-keys and Return for history nav and recents-update
-		func control(_ control: NSControl,
-					 textView: NSTextView,
-					 doCommandBy commandSelector: Selector) -> Bool {
-			guard let vField = control as? NSSearchField else { return false }
-			if commandSelector == #selector(NSResponder.moveUp(_:)) {
+		func control(_ inControl: NSControl,
+					 textView inTextView: NSTextView,
+					 doCommandBy inSelector: Selector) -> Bool {
+			guard let vField = inControl as? NSSearchField else { return false }
+			if inSelector == #selector(NSResponder.moveUp(_:)) {
 				navigateHistory(field: vField, inOlder: true)
 				return true
 			}
-			if commandSelector == #selector(NSResponder.moveDown(_:)) {
+			if inSelector == #selector(NSResponder.moveDown(_:)) {
 				navigateHistory(field: vField, inOlder: false)
 				return true
 			}
-			if commandSelector == #selector(NSControl.insertNewline(_:)) {
+			if inSelector == #selector(NSControl.insertNewline(_:)) {
 				addCurrentToRecents(field: vField)
 				return false
 			}
@@ -190,25 +190,25 @@ struct SearchField: NSViewRepresentable {
 		}
 
 		// adds the current text to the recents list (deduped, newest-first)
-		private func addCurrentToRecents(field: NSSearchField) {
-			let vQuery = field.stringValue.trimmingCharacters(in: .whitespaces)
+		private func addCurrentToRecents(field inField: NSSearchField) {
+			let vQuery = inField.stringValue.trimmingCharacters(in: .whitespaces)
 			guard !vQuery.isEmpty else { return }
-			var vRecents = field.recentSearches
+			var vRecents = inField.recentSearches
 			vRecents.removeAll { $0 == vQuery }
 			vRecents.insert(vQuery, at: 0)
 			if vRecents.count > 30 { vRecents = Array(vRecents.prefix(30)) }
-			field.recentSearches = vRecents
+			inField.recentSearches = vRecents
 			navigationIndex = nil
 		}
 
 		// walks one step through the recent-searches list
-		private func navigateHistory(field: NSSearchField, inOlder: Bool) {
-			let vHistory = field.recentSearches
+		private func navigateHistory(field inField: NSSearchField, inOlder: Bool) {
+			let vHistory = inField.recentSearches
 			if vHistory.isEmpty { return }
 
 			if inOlder {
 				if navigationIndex == nil {
-					savedQuery = field.stringValue
+					savedQuery = inField.stringValue
 					navigationIndex = 0
 				} else if let vI = navigationIndex, vI + 1 < vHistory.count {
 					navigationIndex = vI + 1
@@ -219,7 +219,7 @@ struct SearchField: NSViewRepresentable {
 						navigationIndex = vI - 1
 					} else {
 						navigationIndex = nil
-						field.stringValue = savedQuery
+						inField.stringValue = savedQuery
 						parent.text = savedQuery
 						return
 					}
@@ -230,7 +230,7 @@ struct SearchField: NSViewRepresentable {
 
 			if let vIdx = navigationIndex, vIdx < vHistory.count {
 				let vValue = vHistory[vIdx]
-				field.stringValue = vValue
+				inField.stringValue = vValue
 				parent.text = vValue
 			}
 		}

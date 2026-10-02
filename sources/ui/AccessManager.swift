@@ -68,12 +68,4 @@ final class AccessManager: ObservableObject {
 		}
 		authorizingIds.remove(vId)
 	}
-
-	// wipes the in-memory mapping. Called after ElevatedAccess.cleanup()
-	// removes the on-disk files so the two stay consistent.
-	func reset() {
-		stagedURLs.removeAll()
-		authorizingIds.removeAll()
-		lastError = nil
-	}
 }

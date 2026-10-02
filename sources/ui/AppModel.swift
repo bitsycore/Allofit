@@ -150,6 +150,7 @@ final class AppModel: ObservableObject {
 	// timestamp of the last reloadFromCache() that actually swapped data in
 	private var lastReloadAt: Date?
 
+	// wires up the quit and settings observers (loading happens in start)
 	init() {
 		// the cache file is loaded off-main in start() so the window
 		// appears instantly; here we only wire up observers.
@@ -516,6 +517,7 @@ final class AppModel: ObservableObject {
 		}
 	}
 
+	// saves the index every kAutosaveSeconds while it has unsaved changes
 	private func startAutosaveTimer() {
 		autosaveTimer?.invalidate()
 		// .common mode so the timer fires even while SwiftUI is busy
@@ -613,6 +615,7 @@ final class AppModel: ObservableObject {
 	// MARK: Reader mode
 	// ===========================
 
+	// follows the cache written by another indexer (service or second instance)
 	private func startReaderMode() {
 		let vUrl = IndexStore.cacheURL(forServiceMode: prefs.serviceMode)
 		let vDir = vUrl.deletingLastPathComponent().path

@@ -68,8 +68,8 @@ struct SearchEngine: Sendable {
 			}
 			vJoinNext = false
 		}
-		// cheap name-only groups first: path terms build a lowercased
-		// full path per record, so they only run on records that survived
+		// cheap name-only groups first: path terms scan the folder path
+		// too, so they only run on records that survived the name terms
 		self.groups = vGroups.sorted { vA, vB in
 			!vA.contains(where: { $0.matchesPath }) && vB.contains(where: { $0.matchesPath })
 		}
@@ -194,8 +194,7 @@ struct SearchEngine: Sendable {
 			vResult = false
 		} else if let vPattern = inTerm.pattern {
 			if inTerm.matchesPath {
-				let vPath = FileRecord.searchForm(of: inRecord.fullPath)
-				vResult = matches(inPattern: vPattern, inTarget: vPath)
+				vResult = matchesPath(inPattern: vPattern, inFoldedParent: inRecord.parentLower, inFoldedName: inRecord.nameLower)
 			} else {
 				vResult = matches(inPattern: vPattern, inTarget: inRecord.nameLower)
 			}
@@ -203,7 +202,7 @@ struct SearchEngine: Sendable {
 		return inTerm.negated ? !vResult : vResult
 	}
 
-	// runs a pattern against an already case-folded target string
+	// runs a pattern against an already case-folded name
 	private static func matches(inPattern: Pattern, inTarget: String) -> Bool {
 		var vTarget = inTarget
 		return vTarget.withUTF8 { vBytes in
@@ -213,9 +212,31 @@ struct SearchEngine: Sendable {
 				case .glob(let vGlob):
 					return vGlob.withUnsafeBufferPointer { globMatch(inPattern: $0, inText: vBytes) }
 				case .pathGlob(let vGlob):
-					return vGlob.withUnsafeBufferPointer { pathGlobMatch(inPattern: $0, inText: vBytes) }
+					return vGlob.withUnsafeBufferPointer {
+						pathGlobMatch(inPattern: $0, inText: JoinedBytes(inHead: UnsafeBufferPointer(start: nil, count: 0), inTail: vBytes))
+					}
 				case .extensions(let vExts):
 					return hasExtension(inName: vBytes, inExtensions: vExts)
+			}
+		}
+	}
+
+	// runs a path pattern against folder + "/" + name without building the
+	// joined string (both parts already case-folded)
+	private static func matchesPath(inPattern: Pattern, inFoldedParent: String, inFoldedName: String) -> Bool {
+		var vName = inFoldedName
+		var vParent = inFoldedParent
+		return vName.withUTF8 { vNameBytes in
+			vParent.withUTF8 { vParentBytes in
+				let vText = JoinedBytes(inHead: vParentBytes, inTail: vNameBytes)
+				switch inPattern {
+					case .substring(let vNeedle):
+						return joinedContains(inText: vText, inNeedle: vNeedle)
+					case .pathGlob(let vGlob), .glob(let vGlob):
+						return vGlob.withUnsafeBufferPointer { pathGlobMatch(inPattern: $0, inText: vText) }
+					case .extensions(let vExts):
+						return hasExtension(inName: vNameBytes, inExtensions: vExts)
+				}
 			}
 		}
 	}
@@ -226,6 +247,23 @@ struct SearchEngine: Sendable {
 		if inNeedle.count > inHaystack.count { return false }
 		return inNeedle.withUnsafeBufferPointer { vNeedle in
 			memmem(inHaystack.baseAddress, inHaystack.count, vNeedle.baseAddress, vNeedle.count) != nil
+		}
+	}
+
+	// substring search over folder + "/" + name: inside the folder part,
+	// inside the name, or straddling the "/" between them
+	private static func joinedContains(inText: JoinedBytes, inNeedle: [UInt8]) -> Bool {
+		if containsBytes(inHaystack: inText.head, inNeedle: inNeedle) { return true }
+		if containsBytes(inHaystack: inText.tail, inNeedle: inNeedle) { return true }
+		if inNeedle.count < 2 || inNeedle.count > inText.count { return inNeedle.count == 1 && inText.hasSeparator && inNeedle[0] == UInt8(ascii: "/") }
+		// window around the junction: up to needle-1 bytes on each side
+		let vStart = max(0, inText.head.count - (inNeedle.count - 1))
+		let vEnd = min(inText.count, inText.head.count + (inText.hasSeparator ? 1 : 0) + (inNeedle.count - 1))
+		return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: vEnd - vStart) { vWindow in
+			for vI in vStart..<vEnd {
+				vWindow[vI - vStart] = inText[vI]
+			}
+			return containsBytes(inHaystack: UnsafeBufferPointer(vWindow), inNeedle: inNeedle)
 		}
 	}
 
@@ -241,6 +279,13 @@ struct SearchEngine: Sendable {
 
 	// index of the next UTF-8 scalar start after inIndex
 	private static func nextScalar(in inText: UnsafeBufferPointer<UInt8>, after inIndex: Int) -> Int {
+		var vI = inIndex + 1
+		while vI < inText.count && (inText[vI] & 0xC0) == 0x80 { vI += 1 }
+		return vI
+	}
+
+	// same as nextScalar, over a joined folder + name
+	private static func nextScalar(in inText: JoinedBytes, after inIndex: Int) -> Int {
 		var vI = inIndex + 1
 		while vI < inText.count && (inText[vI] & 0xC0) == 0x80 { vI += 1 }
 		return vI
@@ -282,7 +327,7 @@ struct SearchEngine: Sendable {
 	// (or only at the root when it starts with "/") and must end on one
 	// (end of path, or a "/" in the path). A pattern ending with "/" matches
 	// everything inside that folder.
-	private static func pathGlobMatch(inPattern: UnsafeBufferPointer<UInt8>, inText: UnsafeBufferPointer<UInt8>) -> Bool {
+	private static func pathGlobMatch(inPattern: UnsafeBufferPointer<UInt8>, inText: JoinedBytes) -> Bool {
 		let kSlash = UInt8(ascii: "/")
 		if inPattern.first == kSlash {
 			return pathGlobFrom(inPattern: inPattern, inP: 0, inText: inText, inT: 0)
@@ -297,7 +342,7 @@ struct SearchEngine: Sendable {
 	// inP and text index inT
 	private static func pathGlobFrom(inPattern: UnsafeBufferPointer<UInt8>,
 									 inP: Int,
-									 inText: UnsafeBufferPointer<UInt8>,
+									 inText: JoinedBytes,
 									 inT: Int) -> Bool {
 		let kSlash = UInt8(ascii: "/")
 		let kStar = UInt8(ascii: "*")
@@ -341,5 +386,38 @@ struct SearchEngine: Sendable {
 		}
 		// must stop on a folder boundary, unless the pattern ended with "/"
 		return vT == inText.count || inText[vT] == kSlash || (vP > 0 && inPattern[vP - 1] == kSlash)
+	}
+}
+
+// JoinedBytes presents folder bytes + "/" + name bytes as one read-only
+// byte sequence, so path matching never allocates the joined path.
+private struct JoinedBytes {
+
+	// case-folded folder path ("" for none, "/" for the root)
+	let head: UnsafeBufferPointer<UInt8>
+	// case-folded name
+	let tail: UnsafeBufferPointer<UInt8>
+	// true when a "/" separates head and tail (not after "" or "/")
+	let hasSeparator: Bool
+	// total length including the separator
+	let count: Int
+
+	// joins a folder and a name
+	init(inHead: UnsafeBufferPointer<UInt8>, inTail: UnsafeBufferPointer<UInt8>) {
+		head = inHead
+		tail = inTail
+		hasSeparator = !inHead.isEmpty && !(inHead.count == 1 && inHead[0] == UInt8(ascii: "/"))
+		count = inHead.count + (hasSeparator ? 1 : 0) + inTail.count
+	}
+
+	// byte at inIndex of the joined sequence
+	subscript(inIndex: Int) -> UInt8 {
+		if inIndex < head.count { return head[inIndex] }
+		var vI = inIndex - head.count
+		if hasSeparator {
+			if vI == 0 { return UInt8(ascii: "/") }
+			vI -= 1
+		}
+		return tail[vI]
 	}
 }

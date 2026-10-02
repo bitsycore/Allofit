@@ -73,6 +73,7 @@ struct AllofitWindowContent: View {
 	let access: AccessManager
 	@StateObject private var searchModel: WindowSearchModel
 
+	// creates the per-window content around the shared models
 	init(model inModel: AppModel, access inAccess: AccessManager) {
 		self.model = inModel
 		self.access = inAccess
@@ -89,6 +90,9 @@ struct AllofitWindowContent: View {
 			.environmentObject(searchModel)
 			.frame(minWidth: 760, minHeight: 480)
 			.background(MainWindowMarker())
+			.background(WindowVisibilityReporter { vVisible in
+				searchModel.setWindowVisible(vVisible)
+			})
 			.onAppear {
 				model.start()
 			}
@@ -109,7 +113,9 @@ struct AllofitWindowContent: View {
 // DispatchQueue.main.async sometimes ran before SwiftUI attached the view.
 struct MainWindowMarker: NSViewRepresentable {
 
+	// NSView that records its window as the main window
 	final class MarkerView: NSView {
+		// captures the window once the view is attached to it
 		override func viewDidMoveToWindow() {
 			super.viewDidMoveToWindow()
 			guard let vWindow = self.window else { return }
@@ -122,16 +128,78 @@ struct MainWindowMarker: NSViewRepresentable {
 		}
 	}
 
-	func makeNSView(context: Context) -> NSView {
+	// creates the marker view
+	func makeNSView(context inContext: Context) -> NSView {
 		return MarkerView(frame: .zero)
 	}
 
-	func updateNSView(_ nsView: NSView, context: Context) {
-		// rebind if SwiftUI ever swaps us into a different window
-		if let vWindow = nsView.window, AppDelegate.mainWindow !== vWindow {
+	// rebinds if SwiftUI ever swaps us into a different window
+	func updateNSView(_ inView: NSView, context inContext: Context) {
+		if let vWindow = inView.window, AppDelegate.mainWindow !== vWindow {
 			vWindow.isReleasedWhenClosed = false
 			AppDelegate.mainWindow = vWindow
 		}
+	}
+}
+
+// WindowVisibilityReporter tells its owner whether the hosting window is
+// actually on screen (AppKit occlusion state), so a closed, minimized or
+// fully covered window can skip work nobody would see.
+struct WindowVisibilityReporter: NSViewRepresentable {
+
+	// called on main with true when the window becomes visible
+	let onChange: (Bool) -> Void
+
+	// NSView that follows its window's occlusion notifications
+	final class ReporterView: NSView {
+
+		// latest callback from the SwiftUI side
+		var onChange: ((Bool) -> Void)?
+		// occlusion observer for the current window
+		private var observer: NSObjectProtocol?
+
+		// re-targets the observer whenever the view changes window
+		override func viewDidMoveToWindow() {
+			super.viewDidMoveToWindow()
+			if let vObserver = observer {
+				NotificationCenter.default.removeObserver(vObserver)
+				observer = nil
+			}
+			guard let vWindow = window else {
+				onChange?(false)
+				return
+			}
+			observer = NotificationCenter.default.addObserver(
+				forName: NSWindow.didChangeOcclusionStateNotification,
+				object: vWindow,
+				queue: .main
+			) { [weak self, weak vWindow] _ in
+				guard let vWin = vWindow else { return }
+				MainActor.assumeIsolated {
+					self?.onChange?(vWin.occlusionState.contains(.visible))
+				}
+			}
+			onChange?(vWindow.occlusionState.contains(.visible))
+		}
+
+		// removes the occlusion observer
+		deinit {
+			if let vObserver = observer {
+				NotificationCenter.default.removeObserver(vObserver)
+			}
+		}
+	}
+
+	// creates the reporter view
+	func makeNSView(context inContext: Context) -> NSView {
+		let vView = ReporterView(frame: .zero)
+		vView.onChange = onChange
+		return vView
+	}
+
+	// keeps the view's callback current
+	func updateNSView(_ inView: NSView, context inContext: Context) {
+		(inView as? ReporterView)?.onChange = onChange
 	}
 }
 
@@ -169,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	nonisolated(unsafe) static var mainWindow: NSWindow?
 
 	// called once when the application has finished launching
-	func applicationDidFinishLaunching(_ notification: Notification) {
+	func applicationDidFinishLaunching(_ inNotification: Notification) {
 		// run as a regular foreground app even when launched outside a .app
 		// bundle - covers the SwiftPM "swift run" case
 		NSApp.setActivationPolicy(.regular)
@@ -195,14 +263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	// called on clean Cmd+Q quit; wipes the elevated-access staging dir
 	// so the user-readable copies of privileged files don't linger
-	func applicationWillTerminate(_ notification: Notification) {
+	func applicationWillTerminate(_ inNotification: Notification) {
 		ElevatedAccess.cleanup()
 	}
 
 	// keep the process alive when the user closes the last window: the index
 	// stays in RAM and clicking the dock icon snaps a new window up instantly.
 	// Cmd+Q still quits via the standard Quit menu item.
-	func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+	func applicationShouldTerminateAfterLastWindowClosed(_ inSender: NSApplication) -> Bool {
 		return false
 	}
 
@@ -211,7 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// front first. The action defers to whatever the File > New Window menu
 	// item does (SwiftUI auto-generates that item for WindowGroup) so we stay
 	// compatible with whichever underlying selector SwiftUI uses.
-	func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+	func applicationDockMenu(_ inSender: NSApplication) -> NSMenu? {
 		let vMenu = NSMenu()
 		let vItem = NSMenuItem(title: "New Window",
 								action: #selector(newWindowFromDock(_:)),
@@ -224,7 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// finds the ⌘N main-menu item (File > New Window) and re-invokes its
 	// action. We match on the keyboard shortcut rather than the title so the
 	// lookup survives localized menus.
-	@objc func newWindowFromDock(_ sender: Any?) {
+	@objc func newWindowFromDock(_ inSender: Any?) {
 		guard let vMain = NSApp.mainMenu else { return }
 		for vTop in vMain.items {
 			guard let vSub = vTop.submenu else { continue }
@@ -242,7 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// dock-icon click while no windows are visible: re-show only the main
 	// window and return false so AppKit doesn't run its default "unhide every
 	// hidden window" action (which would also resurrect the Settings window).
-	func applicationShouldHandleReopen(_ sender: NSApplication,
+	func applicationShouldHandleReopen(_ inSender: NSApplication,
 									   hasVisibleWindows inHasVisible: Bool) -> Bool {
 		if inHasVisible { return true }
 		if let vMain = AppDelegate.mainWindow {

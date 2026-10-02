@@ -149,10 +149,11 @@ enum FileIndexer {
 			vName = inURL.lastPathComponent
 			vParentRaw = inURL.deletingLastPathComponent().path
 		}
-		let vParent = inInterner?.intern(vParentRaw) ?? vParentRaw
+		let vParent = inInterner?.intern(vParentRaw)
 		return FileRecord(
 			name: vName,
-			parentPath: vParent,
+			parentPath: vParent?.path ?? vParentRaw,
+			parentLower: vParent?.folded,
 			size: Int64(vValues.fileSize ?? 0),
 			dateCreated: vValues.creationDate ?? .distantPast,
 			dateModified: vValues.contentModificationDate ?? .distantPast,
@@ -161,19 +162,20 @@ enum FileIndexer {
 	}
 }
 
-// PathInterner hands back one shared String instance per distinct value,
-// so the thousands of records of a directory share a single parentPath
-// buffer instead of each holding its own copy. Not thread-safe: use one
+// PathInterner hands back one shared String instance per distinct value
+// (plus its search form), so the thousands of records of a directory share
+// a single parentPath / parentLower buffer instead of each holding a copy. Not thread-safe: use one
 // per walk / load.
 final class PathInterner {
 
-	// distinct value -> shared instance
-	private var table: [String: String] = [:]
+	// distinct value -> (shared instance, shared search form)
+	private var table: [String: (path: String, folded: String)] = [:]
 
-	// returns the shared instance equal to inString
-	func intern(_ inString: String) -> String {
+	// returns the shared instance equal to inString and its search form
+	func intern(_ inString: String) -> (path: String, folded: String) {
 		if let vShared = table[inString] { return vShared }
-		table[inString] = inString
-		return inString
+		let vEntry = (path: inString, folded: FileRecord.sharedSearchForm(of: inString))
+		table[inString] = vEntry
+		return vEntry
 	}
 }

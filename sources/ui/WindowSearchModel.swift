@@ -48,9 +48,23 @@ final class WindowSearchModel: ObservableObject {
 	private let kTypingDebounceSeconds: Double = 0.04
 	// delay after an index change: merges bursts of FSEvents updates
 	private let kIndexDebounceSeconds: Double = 0.3
+	// minimum gap between two refilters caused by index changes. Typing
+	// is unaffected; this caps the cost of an expensive query left open
+	// while files change constantly.
+	private let kIndexRefreshSeconds: Double = 1.0
+	// true while this model's window is on screen (not closed, minimized
+	// or fully covered)
+	private var isWindowVisible = true
+	// true when the index changed while the window was not visible
+	private var isStale = false
+	// true while a throttled index refilter is waiting to run
+	private var isIndexRefreshScheduled = false
+	// when the last index-driven refilter started
+	private var lastIndexRefreshAt = Date.distantPast
 	// records per parallel filter chunk
 	private nonisolated static let kChunkSize = 16_384
 
+	// subscribes to index changes and runs the first filter
 	init(model inModel: AppModel) {
 		self.model = inModel
 		self.sortDescriptor = Preferences.shared.lastSort
@@ -59,10 +73,45 @@ final class WindowSearchModel: ObservableObject {
 		// burst of updates never queues up copies of the index.
 		inModel.recordsChanged
 			.sink { [weak self] in
-				self?.scheduleFilter(inDelay: self?.kIndexDebounceSeconds ?? 0.3)
+				self?.indexDidChange()
 			}
 			.store(in: &cancellables)
 		scheduleFilter(inDelay: 0)
+	}
+
+	// reported by the window: refilters on reappearance if the index
+	// changed while the window was off screen
+	func setWindowVisible(_ inVisible: Bool) {
+		isWindowVisible = inVisible
+		if inVisible && isStale {
+			isStale = false
+			scheduleFilter(inDelay: 0)
+		}
+	}
+
+	// throttled reaction to an index change: nothing while off screen,
+	// otherwise at most one refilter per kIndexRefreshSeconds. The
+	// refilter reads the newest records when it runs, so skipped
+	// notifications lose nothing.
+	private func indexDidChange() {
+		guard isWindowVisible else {
+			isStale = true
+			return
+		}
+		if isIndexRefreshScheduled { return }
+		isIndexRefreshScheduled = true
+		let vSinceLast = Date().timeIntervalSince(lastIndexRefreshAt)
+		let vWait = max(kIndexDebounceSeconds, kIndexRefreshSeconds - vSinceLast)
+		DispatchQueue.main.asyncAfter(deadline: .now() + vWait) { [weak self] in
+			guard let vSelf = self else { return }
+			vSelf.isIndexRefreshScheduled = false
+			guard vSelf.isWindowVisible else {
+				vSelf.isStale = true
+				return
+			}
+			vSelf.lastIndexRefreshAt = Date()
+			vSelf.scheduleFilter(inDelay: 0)
+		}
 	}
 
 	// debounces filter rebuilds so we don't refilter on every keystroke

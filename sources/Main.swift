@@ -6,6 +6,7 @@ import Foundation
 //   anything else / no args    launch the SwiftUI GUI
 @main
 struct Main {
+	// entry point: routes to the GUI, the headless service or the CLI
 	static func main() {
 		let vArgs = Array(CommandLine.arguments.dropFirst())
 		// No args: GUI mode. The Dock and Finder launch us with no args.
@@ -16,7 +17,6 @@ struct Main {
 		// Headless indexer daemon, invoked by launchd's plist.
 		if vArgs.contains("--service") {
 			AllofitService.run()
-			return
 		}
 		// Anything else is a CLI command. Unknown commands print a hint
 		// to stderr and exit 1 rather than silently launching the GUI.

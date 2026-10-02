@@ -28,11 +28,13 @@ final class QuickLookCoordinator: NSObject, @preconcurrency QLPreviewPanelDataSo
 	// MARK: QLPreviewPanelDataSource
 	// ===========================
 
-	func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+	// number of files shown by the panel
+	func numberOfPreviewItems(in inPanel: QLPreviewPanel!) -> Int {
 		return urls.count
 	}
 
-	func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-		return urls[index] as NSURL
+	// file shown at the given panel position
+	func previewPanel(_ inPanel: QLPreviewPanel!, previewItemAt inIndex: Int) -> QLPreviewItem! {
+		return urls[inIndex] as NSURL
 	}
 }

@@ -18,10 +18,12 @@ final class IndexerLock {
 	// open descriptor, -1 when not locked
 	private var fileDescriptor: Int32 = -1
 
-	init(path: String) {
-		self.path = path
+	// creates an unlocked handle for the sentinel file at inPath
+	init(path inPath: String) {
+		self.path = inPath
 	}
 
+	// releases the lock together with the handle
 	deinit {
 		unlock()
 	}
@@ -74,8 +76,8 @@ final class IndexerLock {
 	}
 
 	// reads the pid currently holding the lock, if any (best-effort)
-	static func readHolderPid(path: String) -> Int32? {
-		guard let vData = try? Data(contentsOf: URL(fileURLWithPath: path)),
+	static func readHolderPid(path inPath: String) -> Int32? {
+		guard let vData = try? Data(contentsOf: URL(fileURLWithPath: inPath)),
 			  let vStr = String(data: vData, encoding: .utf8),
 			  let vPid = Int32(vStr.trimmingCharacters(in: .whitespacesAndNewlines))
 		else { return nil }

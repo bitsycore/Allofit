@@ -25,22 +25,29 @@ struct FileRecord: Identifiable, Hashable, Sendable {
 	// lowercased, NFC-normalized name used for case-insensitive matching.
 	// Shares the name's storage when the name is already in that form.
 	let nameLower: String
+	// lowercased, NFC-normalized parent path for path terms. Interned like
+	// parentPath when built through a PathInterner, so a folder's entries
+	// share one copy and path searches do no per-record string work.
+	let parentLower: String
 
-	init(name: String,
-		 parentPath: String,
-		 size: Int64,
-		 dateCreated: Date,
-		 dateModified: Date,
-		 isDirectory: Bool) {
-		self.id = FileRecord.pathHash(inParent: parentPath, inName: name)
-		self.name = name
-		self.parentPath = parentPath
-		self.size = size
-		self.dateCreated = dateCreated
-		self.dateModified = dateModified
-		self.isDirectory = isDirectory
-		let vLower = FileRecord.searchForm(of: name)
-		self.nameLower = (vLower == name) ? name : vLower
+	// builds a record; inParentLower is the precomputed search form of the
+	// parent path (computed here when nil)
+	init(name inName: String,
+		 parentPath inParentPath: String,
+		 parentLower inParentLower: String? = nil,
+		 size inSize: Int64,
+		 dateCreated inDateCreated: Date,
+		 dateModified inDateModified: Date,
+		 isDirectory inIsDirectory: Bool) {
+		self.id = FileRecord.pathHash(inParent: inParentPath, inName: inName)
+		self.name = inName
+		self.parentPath = inParentPath
+		self.parentLower = inParentLower ?? FileRecord.sharedSearchForm(of: inParentPath)
+		self.size = inSize
+		self.dateCreated = inDateCreated
+		self.dateModified = inDateModified
+		self.isDirectory = inIsDirectory
+		self.nameLower = FileRecord.sharedSearchForm(of: inName)
 	}
 
 	// returns the absolute full path computed from parent and name
@@ -61,6 +68,12 @@ struct FileRecord: Identifiable, Hashable, Sendable {
 		let vLower = inString.lowercased()
 		if vLower.utf8.allSatisfy({ $0 < 0x80 }) { return vLower }
 		return vLower.precomposedStringWithCanonicalMapping
+	}
+
+	// search form that reuses the input's storage when nothing changes
+	static func sharedSearchForm(of inString: String) -> String {
+		let vForm = searchForm(of: inString)
+		return vForm == inString ? inString : vForm
 	}
 
 	// 64-bit FNV-1a offset basis and prime

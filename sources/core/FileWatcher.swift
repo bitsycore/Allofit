@@ -23,10 +23,6 @@ struct FSChange {
 	var mustScanSubDirs: Bool {
 		return flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0
 	}
-	// true when this event references a directory
-	var isDir: Bool {
-		return flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
-	}
 }
 
 // FileWatcher streams real-time filesystem change notifications using FSEvents.
@@ -51,16 +47,9 @@ final class FileWatcher: @unchecked Sendable {
 	// guards stream/handler against concurrent access
 	private let lock = NSLock()
 
+	// stops the stream so its callback never outlives the watcher
 	deinit {
 		stop()
-	}
-
-	// returns the latest event id observed by the running stream (or 0)
-	var latestEventId: UInt64 {
-		lock.lock()
-		defer { lock.unlock() }
-		guard let vStream = stream else { return 0 }
-		return UInt64(FSEventStreamGetLatestEventId(vStream))
 	}
 
 	// starts watching inRoots, delivering batches of changes to inHandler

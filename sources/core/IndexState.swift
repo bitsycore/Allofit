@@ -57,12 +57,6 @@ struct IndexState {
 		return positions[FileRecord.pathHash(inPath)] != nil
 	}
 
-	// returns the record at an absolute path, if indexed
-	func record(atPath inPath: String) -> FileRecord? {
-		guard let vPos = positions[FileRecord.pathHash(inPath)] else { return nil }
-		return records[vPos]
-	}
-
 	// ===========================
 	// MARK: Mutations
 	// ===========================

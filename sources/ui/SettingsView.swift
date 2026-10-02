@@ -137,6 +137,7 @@ private struct ExclusionsTab: View {
 		}
 	}
 
+	// presents an Open panel and adds the picked folders as exclusions
 	private func chooseFolder() {
 		let vPanel = NSOpenPanel()
 		vPanel.canChooseDirectories = true
@@ -149,6 +150,7 @@ private struct ExclusionsTab: View {
 		}
 	}
 
+	// removes the currently-selected exclusion
 	private func removeSelected() {
 		guard let vSel = selection else { return }
 		prefs.excludedPaths.removeAll { $0 == vSel }
@@ -446,7 +448,7 @@ private struct CacheTab: View {
 						.foregroundColor(cacheFileExists() ? .primary : .red)
 				}
 				LabeledContent("Size on disk") {
-					Text(formatSize(inBytes: IndexStore.cacheFileSize(at: currentCacheURL())))
+					Text(Formatters.sizeOrDash(bytes: IndexStore.cacheFileSize(at: currentCacheURL())))
 						.font(.callout)
 						.monospacedDigit()
 				}
@@ -525,14 +527,6 @@ private struct CacheTab: View {
 		vFormatter.timeStyle = .medium
 		return vFormatter.string(from: vMtime)
 	}
-
-	// formats a byte count as a human-friendly short string
-	private func formatSize(inBytes: Int64) -> String {
-		if inBytes <= 0 { return "-" }
-		let vF = ByteCountFormatter()
-		vF.countStyle = .file
-		return vF.string(fromByteCount: inBytes)
-	}
 }
 
 // ===========================
@@ -572,7 +566,7 @@ private struct DiagnosticsTab: View {
 						.textSelection(.enabled)
 				}
 				LabeledContent("Cache size") {
-					Text(formatSize(IndexStore.cacheFileSize(at: IndexStore.cacheURL(forServiceMode: prefs.serviceMode))))
+					Text(Formatters.sizeOrDash(bytes: IndexStore.cacheFileSize(at: IndexStore.cacheURL(forServiceMode: prefs.serviceMode))))
 						.font(.callout)
 						.monospacedDigit()
 				}
@@ -695,14 +689,6 @@ private struct DiagnosticsTab: View {
 		vF.dateStyle = .short
 		vF.timeStyle = .medium
 		return vF.string(from: vMtime)
-	}
-
-	// formats a byte count as a human-friendly short string
-	private func formatSize(_ inBytes: Int64) -> String {
-		if inBytes <= 0 { return "-" }
-		let vF = ByteCountFormatter()
-		vF.countStyle = .file
-		return vF.string(fromByteCount: inBytes)
 	}
 
 	// prominent reminder + shortcuts to enable Full Disk Access for the

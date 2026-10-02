@@ -98,11 +98,12 @@ enum IndexStore {
 	// block whose own pool never drains, those would accumulate forever.
 	static func save(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
 		autoreleasepool {
-			save_impl(inRecords: inRecords, inLastEventId: inLastEventId, to: inUrl)
+			saveImpl(inRecords: inRecords, inLastEventId: inLastEventId, to: inUrl)
 		}
 	}
 
-	private static func save_impl(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
+	// encodes, LZ4-compresses and atomically writes the cache (body of save)
+	private static func saveImpl(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
 		var vPayload = Data()
 		vPayload.reserveCapacity(16 + inRecords.count * 80)
 		writeU64(into: &vPayload, value: inLastEventId)
@@ -166,11 +167,12 @@ enum IndexStore {
 	// String allocations don't linger in the caller's pool.
 	static func load(from inUrl: URL) -> LoadResult? {
 		return autoreleasepool {
-			load_impl(from: inUrl)
+			loadImpl(from: inUrl)
 		}
 	}
 
-	private static func load_impl(from inUrl: URL) -> LoadResult? {
+	// reads, decompresses and decodes the cache (body of load)
+	private static func loadImpl(from inUrl: URL) -> LoadResult? {
 		guard let vData = try? Data(contentsOf: inUrl) else { return nil }
 		var vOffset = 0
 		guard let vMagic = readU32(from: vData, offset: &vOffset), vMagic == kMagic else { return nil }
@@ -209,9 +211,11 @@ enum IndexStore {
 			else {
 				return nil
 			}
+			let vShared = vInterner.intern(vParent)
 			vRecords.append(FileRecord(
 				name: vName,
-				parentPath: vInterner.intern(vParent),
+				parentPath: vShared.path,
+				parentLower: vShared.folded,
 				size: vSize,
 				dateCreated: Date(timeIntervalSince1970: vCreated),
 				dateModified: Date(timeIntervalSince1970: vModified),
@@ -225,71 +229,94 @@ enum IndexStore {
 	// MARK: Binary helpers
 	// ===========================
 
-	private static func writeU32(into ioData: inout Data, value: UInt32) {
-		var vV = value.littleEndian
+	// appends a little-endian UInt32
+	private static func writeU32(into ioData: inout Data, value inValue: UInt32) {
+		var vV = inValue.littleEndian
 		withUnsafeBytes(of: &vV) { ioData.append(contentsOf: $0) }
 	}
-	private static func writeU64(into ioData: inout Data, value: UInt64) {
-		var vV = value.littleEndian
+
+	// appends a little-endian UInt64
+	private static func writeU64(into ioData: inout Data, value inValue: UInt64) {
+		var vV = inValue.littleEndian
 		withUnsafeBytes(of: &vV) { ioData.append(contentsOf: $0) }
 	}
-	private static func writeI64(into ioData: inout Data, value: Int64) {
-		var vV = value.littleEndian
+
+	// appends a little-endian Int64
+	private static func writeI64(into ioData: inout Data, value inValue: Int64) {
+		var vV = inValue.littleEndian
 		withUnsafeBytes(of: &vV) { ioData.append(contentsOf: $0) }
 	}
-	private static func writeF64(into ioData: inout Data, value: Double) {
-		var vV = value.bitPattern.littleEndian
+
+	// appends a Double as its little-endian bit pattern
+	private static func writeF64(into ioData: inout Data, value inValue: Double) {
+		var vV = inValue.bitPattern.littleEndian
 		withUnsafeBytes(of: &vV) { ioData.append(contentsOf: $0) }
 	}
-	private static func writeString(into ioData: inout Data, value: String) {
-		let vBytes = Array(value.utf8)
+
+	// appends a UInt32 byte length followed by the UTF-8 bytes
+	private static func writeString(into ioData: inout Data, value inValue: String) {
+		let vBytes = Array(inValue.utf8)
 		writeU32(into: &ioData, value: UInt32(vBytes.count))
 		ioData.append(contentsOf: vBytes)
 	}
-	private static func readU8(from inData: Data, offset: inout Int) -> UInt8? {
-		guard offset + 1 <= inData.count else { return nil }
-		let vV = inData[inData.startIndex + offset]
-		offset += 1
+
+	// reads one byte at ioOffset and advances it; nil past the end
+	private static func readU8(from inData: Data, offset ioOffset: inout Int) -> UInt8? {
+		guard ioOffset + 1 <= inData.count else { return nil }
+		let vV = inData[inData.startIndex + ioOffset]
+		ioOffset += 1
 		return vV
 	}
-	private static func readU32(from inData: Data, offset: inout Int) -> UInt32? {
-		guard offset + 4 <= inData.count else { return nil }
+
+	// reads a little-endian UInt32 at ioOffset and advances it
+	private static func readU32(from inData: Data, offset ioOffset: inout Int) -> UInt32? {
+		guard ioOffset + 4 <= inData.count else { return nil }
+		let vOffset = ioOffset
 		let vV = inData.withUnsafeBytes { (vPtr: UnsafeRawBufferPointer) -> UInt32 in
-			vPtr.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
+			vPtr.loadUnaligned(fromByteOffset: vOffset, as: UInt32.self).littleEndian
 		}
-		offset += 4
+		ioOffset += 4
 		return vV
 	}
-	private static func readU64(from inData: Data, offset: inout Int) -> UInt64? {
-		guard offset + 8 <= inData.count else { return nil }
+
+	// reads a little-endian UInt64 at ioOffset and advances it
+	private static func readU64(from inData: Data, offset ioOffset: inout Int) -> UInt64? {
+		guard ioOffset + 8 <= inData.count else { return nil }
+		let vOffset = ioOffset
 		let vV = inData.withUnsafeBytes { (vPtr: UnsafeRawBufferPointer) -> UInt64 in
-			vPtr.loadUnaligned(fromByteOffset: offset, as: UInt64.self).littleEndian
+			vPtr.loadUnaligned(fromByteOffset: vOffset, as: UInt64.self).littleEndian
 		}
-		offset += 8
+		ioOffset += 8
 		return vV
 	}
-	private static func readI64(from inData: Data, offset: inout Int) -> Int64? {
-		guard offset + 8 <= inData.count else { return nil }
+
+	// reads a little-endian Int64 at ioOffset and advances it
+	private static func readI64(from inData: Data, offset ioOffset: inout Int) -> Int64? {
+		guard ioOffset + 8 <= inData.count else { return nil }
+		let vOffset = ioOffset
 		let vV = inData.withUnsafeBytes { (vPtr: UnsafeRawBufferPointer) -> Int64 in
-			vPtr.loadUnaligned(fromByteOffset: offset, as: Int64.self).littleEndian
+			vPtr.loadUnaligned(fromByteOffset: vOffset, as: Int64.self).littleEndian
 		}
-		offset += 8
+		ioOffset += 8
 		return vV
 	}
-	private static func readF64(from inData: Data, offset: inout Int) -> Double? {
-		guard let vBits = readU64(from: inData, offset: &offset) else { return nil }
+
+	// reads a Double stored as its little-endian bit pattern
+	private static func readF64(from inData: Data, offset ioOffset: inout Int) -> Double? {
+		guard let vBits = readU64(from: inData, offset: &ioOffset) else { return nil }
 		return Double(bitPattern: vBits)
 	}
-	private static func readString(from inData: Data, offset: inout Int) -> String? {
-		guard let vLen = readU32(from: inData, offset: &offset) else { return nil }
+
+	// reads a UInt32-length-prefixed UTF-8 string and advances ioOffset
+	private static func readString(from inData: Data, offset ioOffset: inout Int) -> String? {
+		guard let vLen = readU32(from: inData, offset: &ioOffset) else { return nil }
 		let vLength = Int(vLen)
-		guard offset + vLength <= inData.count else { return nil }
-		let vStart = inData.startIndex + offset
-		let vEnd = vStart + vLength
-		offset += vLength
+		guard ioOffset + vLength <= inData.count else { return nil }
+		let vStart = ioOffset
+		ioOffset += vLength
 		// native decode (no Foundation bridging); invalid bytes are repaired
 		return inData.withUnsafeBytes { vPtr in
-			String(decoding: vPtr[(vStart - inData.startIndex)..<(vEnd - inData.startIndex)], as: UTF8.self)
+			String(decoding: vPtr[vStart..<(vStart + vLength)], as: UTF8.self)
 		}
 	}
 }

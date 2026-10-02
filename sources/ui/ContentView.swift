@@ -113,6 +113,7 @@ struct ContentView: View {
 	// MARK: Column customization persistence
 	// ===========================
 
+	// restores the saved column order / visibility
 	private static func loadColumnCustomization() -> TableColumnCustomization<FileRecord> {
 		guard let vData = UserDefaults.standard.data(forKey: kColumnCustomizationKey),
 			  let vCustom = try? JSONDecoder().decode(
@@ -125,6 +126,7 @@ struct ContentView: View {
 		return vCustom
 	}
 
+	// persists the column order / visibility
 	private nonisolated static func saveColumnCustomization(_ inValue: TableColumnCustomization<FileRecord>) {
 		guard let vData = try? JSONEncoder().encode(inValue) else { return }
 		UserDefaults.standard.set(vData, forKey: kColumnCustomizationKey)
@@ -257,6 +259,7 @@ struct ContentView: View {
 	// MARK: Selection actions
 	// ===========================
 
+	// reveals the selected files in Finder
 	private func revealSelection(inIds: Set<FileRecord.ID>) {
 		// reveal in Finder shows the *original* file (not the staged copy),
 		// since the user wants to navigate to the real location on disk
@@ -264,6 +267,7 @@ struct ContentView: View {
 		NSWorkspace.shared.activateFileViewerSelecting(vUrls)
 	}
 
+	// opens the selected files in the Quick Look panel
 	private func quickLookSelection(inIds: Set<FileRecord.ID>) {
 		// prefer the staged URL when one exists - QLPreviewPanel renders
 		// it without permission issues, whereas the original would fail
@@ -271,6 +275,7 @@ struct ContentView: View {
 		QuickLookCoordinator.shared.show(inUrls: vUrls)
 	}
 
+	// copies the selected paths, one per line
 	private func copyPaths(inIds: Set<FileRecord.ID>) {
 		// always copy the original path - the staged tmp path is an
 		// implementation detail that has no meaning outside this session
@@ -279,6 +284,7 @@ struct ContentView: View {
 		NSPasteboard.general.setString(vPaths.joined(separator: "\n"), forType: .string)
 	}
 
+	// opens the selected files with their default app
 	private func openSelection(inIds: Set<FileRecord.ID>) {
 		// open the staged copy when available so the default app can read
 		// it; falls back to the original path for files we can read directly
@@ -287,6 +293,7 @@ struct ContentView: View {
 		}
 	}
 
+	// visible records with the given ids
 	private func recordsFor(inIds: Set<FileRecord.ID>) -> [FileRecord] {
 		return searchModel.visibleRecords.filter { inIds.contains($0.id) }
 	}
@@ -295,6 +302,7 @@ struct ContentView: View {
 	// MARK: Sort mapping
 	// ===========================
 
+	// converts a Table sort comparator into a sort mode
 	private static func mapSortOrder(inComparator: KeyPathComparator<FileRecord>) -> FileSortDescriptor {
 		let vAsc = inComparator.order == .forward
 		let vKp = inComparator.keyPath
@@ -306,6 +314,7 @@ struct ContentView: View {
 		return .nameAscending
 	}
 
+	// converts a sort mode into a Table sort comparator
 	private static func comparatorFor(inDescriptor: FileSortDescriptor) -> KeyPathComparator<FileRecord> {
 		switch inDescriptor {
 			case .nameAscending: return KeyPathComparator(\FileRecord.name, order: .forward)

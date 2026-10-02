@@ -12,7 +12,8 @@ struct QuickLookPreviewView: NSViewRepresentable {
 	// the file to preview; nil clears the view
 	let url: URL?
 
-	func makeNSView(context: Context) -> NSView {
+	// creates the embedded Quick Look view
+	func makeNSView(context inContext: Context) -> NSView {
 		guard let vView = QLPreviewView(frame: .zero, style: .normal) else {
 			return NSView()
 		}
@@ -23,8 +24,9 @@ struct QuickLookPreviewView: NSViewRepresentable {
 		return vView
 	}
 
-	func updateNSView(_ nsView: NSView, context: Context) {
-		guard let vQlView = nsView as? QLPreviewView else { return }
+	// shows the current file
+	func updateNSView(_ inView: NSView, context inContext: Context) {
+		guard let vQlView = inView as? QLPreviewView else { return }
 		vQlView.previewItem = (url as NSURL?)
 	}
 }

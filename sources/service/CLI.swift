@@ -89,6 +89,7 @@ enum CLI {
 		}
 	}
 
+	// starts the installed service(s) named by the arguments
 	private static func runStart(inArgs: [String]) {
 		let vScopes = scopesToActOn(inArgs: inArgs, defaultMode: .firstInstalled)
 		guard !vScopes.isEmpty else {
@@ -105,6 +106,7 @@ enum CLI {
 		}
 	}
 
+	// stops the running service(s) named by the arguments
 	private static func runStop(inArgs: [String]) {
 		let vScopes = scopesToActOn(inArgs: inArgs, defaultMode: .firstInstalled)
 		guard !vScopes.isEmpty else {
@@ -148,12 +150,14 @@ enum CLI {
 		print("Service mode set to \(vMode.rawValue).")
 	}
 
+	// stores the service mode in one preferences domain
 	private static func writeMode(_ inMode: Preferences.ServiceMode, toDomain inDomain: String) {
 		guard let vDefaults = UserDefaults(suiteName: inDomain) else { return }
 		vDefaults.set(inMode.rawValue, forKey: kServiceModeKey)
 		vDefaults.synchronize()
 	}
 
+	// prints the install / run state of both service scopes
 	private static func runStatus() {
 		print("Bundle version: \(ServiceInstaller.bundleVersion())")
 		for vScope in [ServiceInstaller.Scope.userAgent, .rootDaemon] {
@@ -180,6 +184,7 @@ enum CLI {
 	private static let kProcessName = "Allofit"
 	private static let kServiceModeKey = "Allofit.serviceMode"
 
+	// which scopes a command targets when none is given
 	private enum ScopeResolution {
 		case firstInstalled
 		case everyInstalled
@@ -189,13 +194,13 @@ enum CLI {
 	//   - explicit `user`/`root` arg: just that one
 	//   - no arg, firstInstalled mode: the single installed scope, if any
 	//   - no arg, everyInstalled mode: all installed scopes
-	private static func scopesToActOn(inArgs: [String], defaultMode: ScopeResolution) -> [ServiceInstaller.Scope] {
+	private static func scopesToActOn(inArgs: [String], defaultMode inDefaultMode: ScopeResolution) -> [ServiceInstaller.Scope] {
 		if let vScope = parseScope(inArgs.first) {
 			return [vScope]
 		}
 		let vAll: [ServiceInstaller.Scope] = [.userAgent, .rootDaemon]
 		let vInstalled = vAll.filter { ServiceInstaller.isInstalled(inScope: $0) }
-		switch defaultMode {
+		switch inDefaultMode {
 			case .firstInstalled:
 				return vInstalled.first.map { [$0] } ?? []
 			case .everyInstalled:
@@ -203,6 +208,7 @@ enum CLI {
 		}
 	}
 
+	// maps a user / root argument (and aliases) to a scope
 	private static func parseScope(_ inArg: String?) -> ServiceInstaller.Scope? {
 		guard let vArg = inArg else { return nil }
 		switch vArg {
@@ -215,6 +221,7 @@ enum CLI {
 		}
 	}
 
+	// human-readable name of a scope
 	private static func label(for inScope: ServiceInstaller.Scope) -> String {
 		switch inScope {
 			case .userAgent: return "user agent"
@@ -228,6 +235,7 @@ enum CLI {
 		exit(1)
 	}
 
+	// prints the command-line usage
 	private static func printHelp() {
 		print("""
 		Usage: allofit [command [args]]

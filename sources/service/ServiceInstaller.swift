@@ -84,18 +84,18 @@ enum ServiceInstaller {
 				let vTarget = rootDaemonPath()
 				let vDaemonDir = (vDaemonBinary as NSString).deletingLastPathComponent
 				let vScript = """
-				mkdir -p \(shellQuote(inString: vDaemonDir)) \
-				&& rm -f \(shellQuote(inString: vDaemonBinary)) \
-				&& cp \(shellQuote(inString: vBinary)) \(shellQuote(inString: vDaemonBinary)) \
-				&& chown root:wheel \(shellQuote(inString: vDaemonBinary)) \
-				&& chmod 755 \(shellQuote(inString: vDaemonBinary)) \
-				&& printf '%s' \(shellQuote(inString: vVersionString)) > \(shellQuote(inString: vVersionFile)) \
-				&& chmod 644 \(shellQuote(inString: vVersionFile)) \
-				&& cp \(shellQuote(inString: vTmp.path)) \(shellQuote(inString: vTarget.path)) \
-				&& chown root:wheel \(shellQuote(inString: vTarget.path)) \
-				&& chmod 644 \(shellQuote(inString: vTarget.path)) \
-				; /bin/launchctl bootout system \(shellQuote(inString: vTarget.path)) 2>/dev/null \
-				; /bin/launchctl bootstrap system \(shellQuote(inString: vTarget.path))
+				mkdir -p \(AdminShell.quote(vDaemonDir)) \
+				&& rm -f \(AdminShell.quote(vDaemonBinary)) \
+				&& cp \(AdminShell.quote(vBinary)) \(AdminShell.quote(vDaemonBinary)) \
+				&& chown root:wheel \(AdminShell.quote(vDaemonBinary)) \
+				&& chmod 755 \(AdminShell.quote(vDaemonBinary)) \
+				&& printf '%s' \(AdminShell.quote(vVersionString)) > \(AdminShell.quote(vVersionFile)) \
+				&& chmod 644 \(AdminShell.quote(vVersionFile)) \
+				&& cp \(AdminShell.quote(vTmp.path)) \(AdminShell.quote(vTarget.path)) \
+				&& chown root:wheel \(AdminShell.quote(vTarget.path)) \
+				&& chmod 644 \(AdminShell.quote(vTarget.path)) \
+				; /bin/launchctl bootout system \(AdminShell.quote(vTarget.path)) 2>/dev/null \
+				; /bin/launchctl bootstrap system \(AdminShell.quote(vTarget.path))
 				"""
 				try runWithAdminPrivileges(inScript: vScript)
 		}
@@ -117,8 +117,8 @@ enum ServiceInstaller {
 			case .rootDaemon:
 				let vTarget = rootDaemonPath()
 				let vScript = """
-				/bin/launchctl bootout system \(shellQuote(inString: vTarget.path)) 2>/dev/null \
-				; rm -f \(shellQuote(inString: vTarget.path)) \(shellQuote(inString: vDaemonBinary)) \(shellQuote(inString: vVersionFile))
+				/bin/launchctl bootout system \(AdminShell.quote(vTarget.path)) 2>/dev/null \
+				; rm -f \(AdminShell.quote(vTarget.path)) \(AdminShell.quote(vDaemonBinary)) \(AdminShell.quote(vVersionFile))
 				"""
 				try runWithAdminPrivileges(inScript: vScript)
 		}
@@ -146,7 +146,7 @@ enum ServiceInstaller {
 				}
 			case .rootDaemon:
 				let vPlist = rootDaemonPath().path
-				let vScript = "/bin/launchctl bootout system \(shellQuote(inString: vPlist))"
+				let vScript = "/bin/launchctl bootout system \(AdminShell.quote(vPlist))"
 				try runWithAdminPrivileges(inScript: vScript)
 		}
 	}
@@ -162,7 +162,7 @@ enum ServiceInstaller {
 				}
 			case .rootDaemon:
 				let vPlist = rootDaemonPath().path
-				let vScript = "/bin/launchctl bootstrap system \(shellQuote(inString: vPlist))"
+				let vScript = "/bin/launchctl bootstrap system \(AdminShell.quote(vPlist))"
 				try runWithAdminPrivileges(inScript: vScript)
 		}
 	}
@@ -217,7 +217,7 @@ enum ServiceInstaller {
 			case .rootDaemon:
 				let vPlist = rootDaemonPath().path
 				let vCache = inCacheURL.path
-				let vScript = "/bin/launchctl bootout system \(shellQuote(inString: vPlist)) 2>/dev/null ; rm -f \(shellQuote(inString: vCache)) ; /bin/launchctl bootstrap system \(shellQuote(inString: vPlist))"
+				let vScript = "/bin/launchctl bootout system \(AdminShell.quote(vPlist)) 2>/dev/null ; rm -f \(AdminShell.quote(vCache)) ; /bin/launchctl bootstrap system \(AdminShell.quote(vPlist))"
 				try runWithAdminPrivileges(inScript: vScript)
 		}
 	}
@@ -226,11 +226,13 @@ enum ServiceInstaller {
 	// MARK: Internals
 	// ===========================
 
+	// location of the per-user LaunchAgent plist
 	private static func userAgentPath() -> URL {
 		return FileManager.default.homeDirectoryForCurrentUser
 			.appendingPathComponent("Library/LaunchAgents/\(kLabel).plist")
 	}
 
+	// location of the system-wide LaunchDaemon plist
 	private static func rootDaemonPath() -> URL {
 		return URL(fileURLWithPath: "/Library/LaunchDaemons/\(kLabel).plist")
 	}
@@ -322,11 +324,5 @@ enum ServiceInstaller {
 		} catch let vErr as AdminShell.Error {
 			throw InstallError.authorizationFailed(vErr.errorDescription ?? "\(vErr)")
 		}
-	}
-
-	// shell-quote helper, delegating to the shared AdminShell quoter so
-	// both call sites use the same escaping rules
-	private static func shellQuote(inString: String) -> String {
-		return AdminShell.quote(inString)
 	}
 }
