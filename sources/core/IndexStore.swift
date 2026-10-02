@@ -87,7 +87,7 @@ enum IndexStore {
 	// ===========================
 
 	// writes the records and event id atomically to the default cacheURL
-	static func save(inRecords: [FileRecord], inLastEventId: UInt64) {
+	static func save(inRecords: some Collection<FileRecord>, inLastEventId: UInt64) {
 		save(inRecords: inRecords, inLastEventId: inLastEventId, to: cacheURL)
 	}
 
@@ -96,14 +96,14 @@ enum IndexStore {
 	// of Foundation objects (the compressed NSData, NSURLs created by
 	// FileManager.replaceItem, etc.) - if the caller is a long-running
 	// block whose own pool never drains, those would accumulate forever.
-	static func save(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
+	static func save(inRecords: some Collection<FileRecord>, inLastEventId: UInt64, to inUrl: URL) {
 		autoreleasepool {
 			saveImpl(inRecords: inRecords, inLastEventId: inLastEventId, to: inUrl)
 		}
 	}
 
 	// encodes, LZ4-compresses and atomically writes the cache (body of save)
-	private static func saveImpl(inRecords: [FileRecord], inLastEventId: UInt64, to inUrl: URL) {
+	private static func saveImpl(inRecords: some Collection<FileRecord>, inLastEventId: UInt64, to inUrl: URL) {
 		var vPayload = Data()
 		vPayload.reserveCapacity(16 + inRecords.count * 80)
 		writeU64(into: &vPayload, value: inLastEventId)

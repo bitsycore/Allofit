@@ -1,17 +1,28 @@
 import Foundation
 
-// ResultSorter turns the matching positions of a search into the first N
-// records in the requested order. Only N rows are ever displayed, so instead
-// of sorting every match (seconds for an unfiltered million-entry index) it
-// keeps a bounded max-heap of the best N candidates: O(m log N), and in
-// practice about one comparison per match once the heap is warm.
+// ResultSorter orders the matching positions of a search. The full order of
+// a large result takes a while (~0.2 s for 600k entries), so the first rows
+// can be computed on their own: a bounded max-heap of the best N candidates
+// is O(m log N), about one comparison per match once the heap is warm, which
+// lets the top of the list appear before the complete sort finishes.
 enum ResultSorter {
 
 	// returns the first inLimit records of inPositions, ordered by inDescriptor
-	static func top(inRecords: [FileRecord],
-					inPositions: [Int32],
-					inLimit: Int,
-					inDescriptor: FileSortDescriptor) -> [FileRecord] {
+	static func top<C: RandomAccessCollection>(inRecords: C,
+											   inPositions: [Int32],
+											   inLimit: Int,
+											   inDescriptor: FileSortDescriptor) -> [FileRecord]
+	where C.Index == Int, C.Element == FileRecord {
+		return topPositions(inRecords: inRecords, inPositions: inPositions, inLimit: inLimit, inDescriptor: inDescriptor)
+			.map { inRecords[Int($0)] }
+	}
+
+	// same as top, returning positions into inRecords instead of copies
+	static func topPositions<C: RandomAccessCollection>(inRecords: C,
+														inPositions: [Int32],
+														inLimit: Int,
+														inDescriptor: FileSortDescriptor) -> [Int32]
+	where C.Index == Int, C.Element == FileRecord {
 		let vLess = comparator(for: inDescriptor)
 		// strict weak order on positions, ties broken by id for stability
 		let vBefore: (Int32, Int32) -> Bool = { vA, vB in
@@ -23,7 +34,7 @@ enum ResultSorter {
 		}
 
 		if inPositions.count <= inLimit {
-			return inPositions.sorted(by: vBefore).map { inRecords[Int($0)] }
+			return inPositions.sorted(by: vBefore)
 		}
 
 		// max-heap (worst candidate on top) of the best inLimit seen so far
@@ -49,7 +60,7 @@ enum ResultSorter {
 			vHeap[0] = vPos
 			siftDown(0)
 		}
-		return vHeap.sorted(by: vBefore).map { inRecords[Int($0)] }
+		return vHeap.sorted(by: vBefore)
 	}
 
 	// primary ordering for each sort mode. Names compare on the folded form

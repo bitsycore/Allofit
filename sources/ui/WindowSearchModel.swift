@@ -33,9 +33,13 @@ final class WindowSearchModel: ObservableObject {
 	@Published var filter: SearchFilter = .everything {
 		didSet { scheduleFilter(inDelay: kTypingDebounceSeconds) }
 	}
-	// the filtered, sorted and capped records currently shown in the table
-	@Published private(set) var visibleRecords: [FileRecord] = []
-	// what to emphasize in the shown results (always matches visibleRecords)
+	// every record matching the query, sorted (the table shows them all;
+	// only the rows on screen get views)
+	@Published private(set) var results = ResultList()
+	// bumped on every change of results, so the table can tell a new list
+	// from the same one without comparing hundreds of thousands of records
+	@Published private(set) var resultsVersion = 0
+	// what to emphasize in the shown results (always matches results)
 	@Published private(set) var highlights = SearchEngine.Highlights()
 	// match count and timing for the status bar (observed separately so
 	// their updates don't re-render the table)
@@ -49,8 +53,13 @@ final class WindowSearchModel: ObservableObject {
 	// pending filter+sort task, cancelled if a newer one supersedes it
 	private var filterTask: Task<Void, Never>?
 
-	// maximum rows handed to SwiftUI Table for snappy scrolling
-	private let kMaxVisibleRows = 2000
+	// rows published first when a query matches more than this: the top of
+	// the list appears in milliseconds, the complete sort follows (a full
+	// sort of 600k entries takes ~0.2 s)
+	private nonisolated static let kQuickRows = 2000
+	// above this many results, skip the "same list" comparison (it would
+	// cost more than just reloading the visible rows)
+	private nonisolated static let kCompareLimit = 5000
 	// delay after a keystroke / sort click: just enough to merge key repeats
 	private let kTypingDebounceSeconds: Double = 0.04
 	// delay after an index change: merges bursts of FSEvents updates
@@ -64,8 +73,6 @@ final class WindowSearchModel: ObservableObject {
 	private var isIndexRefreshScheduled = false
 	// when the last index-driven refilter started
 	private var lastIndexRefreshAt = Date.distantPast
-	// records per parallel filter chunk
-	private nonisolated static let kChunkSize = 16_384
 
 	// subscribes to index changes and runs the first filter
 	init(model inModel: AppModel) {
@@ -95,8 +102,26 @@ final class WindowSearchModel: ObservableObject {
 	// drops rows right away (e.g. after Move to Trash); the index catches up
 	// through FSEvents a moment later
 	func removeVisible(inIds: Set<FileRecord.ID>) {
-		visibleRecords.removeAll { inIds.contains($0.id) }
-		stats.matchCount = max(0, stats.matchCount - inIds.count)
+		results = results.removing(inIds: inIds)
+		resultsVersion &+= 1
+		stats.matchCount = results.count
+	}
+
+	// publishes a result list (and its count / highlights) on main
+	private func publish(inResults: ResultList,
+						 inCount: Int,
+						 inHighlights: SearchEngine.Highlights,
+						 inMilliseconds: Double?) {
+		if stats.matchCount != inCount { stats.matchCount = inCount }
+		if let vMs = inMilliseconds { stats.lastSearchMilliseconds = vMs }
+		if highlights != inHighlights { highlights = inHighlights }
+		// skip a no-op reassignment of a small identical list (full record
+		// equality also catches size / date updates)
+		if inResults.count <= Self.kCompareLimit && results.count == inResults.count && results.elementsEqual(inResults) {
+			return
+		}
+		results = inResults
+		resultsVersion &+= 1
 	}
 
 	// throttled reaction to an index change: nothing while off screen,
@@ -127,21 +152,25 @@ final class WindowSearchModel: ObservableObject {
 				return
 			}
 			vSelf.lastIndexRefreshAt = Date()
-			vSelf.scheduleFilter(inDelay: 0)
+			// no quick partial list here: it would briefly cut the list to
+			// its first rows and lose the scroll position of a user
+			// browsing further down
+			vSelf.scheduleFilter(inDelay: 0, inProgressive: false)
 		}
 	}
 
 	// debounces filter rebuilds so we don't refilter on every keystroke
 	// or every FSEvents batch. The latest call wins: earlier pending
 	// tasks are cancelled before they start (or between chunks).
-	private func scheduleFilter(inDelay: Double) {
+	// inProgressive publishes the first rows before the complete sort
+	// when there are many results (typing, sort and filter changes).
+	private func scheduleFilter(inDelay: Double, inProgressive: Bool = true) {
 		filterTask?.cancel()
 		// snapshot inputs on main; the detached task is self-contained
 		let vQuery = filter.apply(toQuery: query)
 		let vHighlights = SearchEngine(inQuery: query).highlights
 		let vSort = sortDescriptor
 		let vRecords = model.allRecords
-		let vMax = kMaxVisibleRows
 		let vDelayNanos = UInt64(inDelay * 1_000_000_000)
 		filterTask = Task.detached(priority: .userInitiated) { [weak self] in
 			if vDelayNanos > 0 {
@@ -164,43 +193,53 @@ final class WindowSearchModel: ObservableObject {
 			}
 			guard let vPositions = vResult else { return }
 			if Task.isCancelled { return }
-			let vTop = ResultSorter.top(
+			let vCount = vPositions.count
+			// timing covers the filter plus the first displayable sort
+			var vMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - vStartedAt.uptimeNanoseconds) / 1_000_000
+			if inProgressive && vCount > WindowSearchModel.kQuickRows {
+				let vTop = ResultList(inStore: vRecords, inPositions: ResultSorter.topPositions(
+					inRecords: vRecords,
+					inPositions: vPositions,
+					inLimit: WindowSearchModel.kQuickRows,
+					inDescriptor: vSort
+				))
+				if Task.isCancelled { return }
+				vMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - vStartedAt.uptimeNanoseconds) / 1_000_000
+				let vQuickMs = vMilliseconds
+				// hop back to main with DispatchQueue.main.async (rather than
+				// await MainActor.run) so the assignment lands on the next
+				// runloop tick, avoiding NSTableView reentrance when the
+				// search field is mid-edit
+				DispatchQueue.main.async {
+					self?.publish(inResults: vTop, inCount: vCount, inHighlights: vHighlights, inMilliseconds: vQuickMs)
+				}
+			}
+			let vAll = ResultList(inStore: vRecords, inPositions: ResultSorter.topPositions(
 				inRecords: vRecords,
 				inPositions: vPositions,
-				inLimit: vMax,
+				inLimit: vCount,
 				inDescriptor: vSort
-			)
+			))
 			if Task.isCancelled { return }
-			let vCount = vPositions.count
-			let vMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - vStartedAt.uptimeNanoseconds) / 1_000_000
-			// hop back to main with DispatchQueue.main.async (rather than
-			// await MainActor.run) so the assignment is guaranteed to land
-			// on the next runloop tick, avoiding NSTableView reentrance when
-			// the search field is mid-edit
+			let vFinalMs: Double? = (inProgressive && vCount > WindowSearchModel.kQuickRows)
+				? nil
+				: Double(DispatchTime.now().uptimeNanoseconds - vStartedAt.uptimeNanoseconds) / 1_000_000
 			DispatchQueue.main.async {
-				guard let vSelf = self else { return }
-				if vSelf.stats.matchCount != vCount { vSelf.stats.matchCount = vCount }
-				vSelf.stats.lastSearchMilliseconds = vMilliseconds
-				if vSelf.highlights != vHighlights { vSelf.highlights = vHighlights }
-				// Skip the @Published fire when the resulting list is
-				// identical to what the Table is already showing. Full
-				// FileRecord equality catches mtime / size updates, so we
-				// only skip true no-op reassignments.
-				if vSelf.visibleRecords == vTop { return }
-				vSelf.visibleRecords = vTop
+				self?.publish(inResults: vAll, inCount: vCount, inHighlights: vHighlights, inMilliseconds: vFinalMs)
 			}
 		}
 	}
 
 	// positions of the records matching the engine, computed in parallel
 	// chunks. Returns nil if the task was cancelled midway.
-	private nonisolated static func matchingPositions(inRecords: [FileRecord],
+	private nonisolated static func matchingPositions(inRecords: RecordStore,
 													  inEngine: SearchEngine,
 													  inCancelled: ManagedAtomicFlag) -> [Int32]? {
 		if !inEngine.isActive {
 			return (0..<Int32(inRecords.count)).map { $0 }
 		}
-		let vChunkCount = (inRecords.count + kChunkSize - 1) / kChunkSize
+		// one parallel job per store chunk, reading its records directly
+		let vChunkCount = inRecords.chunkCount
 		if vChunkCount == 0 { return [] }
 		var vChunks = [[Int32]](repeating: [], count: vChunkCount)
 		vChunks.withUnsafeMutableBufferPointer { vOut in
@@ -208,11 +247,11 @@ final class WindowSearchModel: ObservableObject {
 			nonisolated(unsafe) let vOutBase = vOut.baseAddress!
 			DispatchQueue.concurrentPerform(iterations: vChunkCount) { vChunk in
 				if inCancelled.isSet { return }
-				let vStart = vChunk * kChunkSize
-				let vEnd = min(vStart + kChunkSize, inRecords.count)
+				let vRecords = inRecords.chunk(at: vChunk)
+				let vBase = Int32(vChunk << RecordStore.kShift)
 				var vLocal: [Int32] = []
-				for vI in vStart..<vEnd where inEngine.match(inRecord: inRecords[vI]) {
-					vLocal.append(Int32(vI))
+				for (vI, vRecord) in vRecords.enumerated() where inEngine.match(inRecord: vRecord) {
+					vLocal.append(vBase + Int32(vI))
 				}
 				(vOutBase + vChunk).pointee = vLocal
 			}

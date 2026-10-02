@@ -85,7 +85,7 @@ struct PreviewPane: View {
 
 	private var selectedRecord: FileRecord? {
 		guard selection.count == 1, let vId = selection.first else { return nil }
-		return searchModel.visibleRecords.first(where: { $0.id == vId })
+		return searchModel.results.first(where: { $0.id == vId })
 	}
 
 	var body: some View {

@@ -109,7 +109,7 @@ final class AppModel: ObservableObject {
 	// the canonical index (records + id lookup), main-thread only
 	private var index = IndexState()
 	// every entry observed so far, in no particular order
-	var allRecords: [FileRecord] { index.records }
+	var allRecords: RecordStore { index.records }
 	// fires on main after allRecords changed (no payload by design)
 	let recordsChanged = PassthroughSubject<Void, Never>()
 	// when the index last changed; read by the status bar on its own

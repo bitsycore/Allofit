@@ -160,6 +160,26 @@ struct IndexStateTests {
 		#expect(VolumeManager.canonicalPath(inPath: "/no/such/root/") == "/no/such/root")
 	}
 
+	@Test func recordStoreChunksAndCopiesOnWrite() {
+		var vStore = RecordStore()
+		let vTotal = RecordStore.kChunkSize * 2 + 10
+		for vI in 0..<vTotal { vStore.append(Self.file("/r/f\(vI)")) }
+		#expect(vStore.count == vTotal)
+		#expect(vStore[RecordStore.kChunkSize].name == "f\(RecordStore.kChunkSize)")
+		// a snapshot keeps its values when the original changes
+		let vSnapshot = vStore
+		vStore[5] = Self.file("/r/changed")
+		#expect(vSnapshot[5].name == "f5")
+		#expect(vStore[5].name == "changed")
+		for _ in 0..<11 { vStore.removeLast() }
+		#expect(vStore.count == RecordStore.kChunkSize * 2 - 1)
+		#expect(vStore.last?.name == "f\(RecordStore.kChunkSize * 2 - 2)")
+		// result lists read through the snapshot
+		let vList = ResultList(inStore: vSnapshot, inPositions: [3, 1])
+		#expect(vList.map(\.name) == ["f3", "f1"])
+		#expect(vList.removing(inIds: [vSnapshot[3].id]).map(\.name) == ["f1"])
+	}
+
 	@Test func minimalRootsDropsNestedPaths() {
 		let vRoots = SubtreeMatcher.minimalRoots(inPaths: ["/a/b", "/a", "/a b/c", "/a", "/c"])
 		#expect(vRoots.sorted() == ["/a", "/a b/c", "/c"])
@@ -179,7 +199,7 @@ struct IndexStateTests {
 		let vUrl = FileManager.default.temporaryDirectory
 			.appendingPathComponent("allofit-test-\(UUID().uuidString).bin")
 		defer { try? FileManager.default.removeItem(at: vUrl) }
-		let vRecords = Self.sampleState().records
+		let vRecords = Array(Self.sampleState().records)
 		IndexStore.save(inRecords: vRecords, inLastEventId: 42, to: vUrl)
 		let vLoaded = try #require(IndexStore.load(from: vUrl))
 		#expect(vLoaded.lastEventId == 42)

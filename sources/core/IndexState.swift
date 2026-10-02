@@ -35,13 +35,13 @@ struct ResolvedChanges: Sendable {
 struct IndexState {
 
 	// all indexed entries, unordered
-	private(set) var records: [FileRecord] = []
+	// (chunked: snapshots are cheap and a change copies only one chunk)
+	private(set) var records = RecordStore()
 	// FileRecord.id -> position in records
 	private(set) var positions: [UInt64: Int] = [:]
 
 	// builds the state from a list of records, dropping duplicate paths
 	init(inRecords: [FileRecord] = []) {
-		records.reserveCapacity(inRecords.count)
 		positions.reserveCapacity(inRecords.count)
 		for vRecord in inRecords where positions[vRecord.id] == nil {
 			positions[vRecord.id] = records.count
@@ -209,10 +209,7 @@ struct IndexState {
 	// the slack can amount to hundreds of MB.
 	func compacted() -> IndexState {
 		var vResult = IndexState()
-		vResult.records = Array(unsafeUninitializedCapacity: records.count) { vBuffer, vCount in
-			_ = vBuffer.initialize(from: records)
-			vCount = records.count
-		}
+		vResult.records = RecordStore(records)
 		vResult.positions = Dictionary(minimumCapacity: positions.count)
 		for (vKey, vValue) in positions {
 			vResult.positions[vKey] = vValue
