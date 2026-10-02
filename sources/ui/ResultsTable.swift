@@ -190,6 +190,9 @@ struct ResultsTable: NSViewRepresentable {
 				shownHighlightEnabled = inParent.highlightEnabled
 				records = inParent.records
 				vTable.reloadData()
+				// background refreshes reload often: keep the overlay of
+				// the hovered cell instead of making it flicker away
+				(vTable as? ResultsNSTableView)?.refreshHover()
 				restoreSelection(inTable: vTable)
 			} else if selectedIds(inTable: vTable) != inParent.selection {
 				restoreSelection(inTable: vTable)
@@ -379,9 +382,102 @@ final class ResultsNSTableView: NSTableView {
 	// owner that performs the actions
 	weak var coordinator: ResultsTable.Coordinator?
 
+	// how long the pointer rests on a cut-off cell before its full text shows
+	private let kHoverDelaySeconds: TimeInterval = 0.5
+	// cell under the pointer (row, column), nil when none
+	private var hoveredCell: (row: Int, column: Int)?
+	// pending overlay display for the hovered cell
+	private var hoverTimer: Timer?
+
+	// follows the pointer over the visible part of the table
+	override func updateTrackingAreas() {
+		super.updateTrackingAreas()
+		for vArea in trackingAreas where vArea.owner === self {
+			removeTrackingArea(vArea)
+		}
+		addTrackingArea(NSTrackingArea(
+			rect: .zero,
+			options: [.mouseMoved, .mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+			owner: self,
+			userInfo: nil
+		))
+	}
+
+	// pointer moved: restart the hover delay when it enters another cell
+	override func mouseMoved(with inEvent: NSEvent) {
+		super.mouseMoved(with: inEvent)
+		let vPoint = convert(inEvent.locationInWindow, from: nil)
+		let vRow = row(at: vPoint)
+		let vColumn = column(at: vPoint)
+		if let vCurrent = hoveredCell, vCurrent.row == vRow, vCurrent.column == vColumn { return }
+		endHover()
+		guard vRow >= 0, vColumn >= 0 else { return }
+		hoveredCell = (vRow, vColumn)
+		hoverTimer = Timer.scheduledTimer(withTimeInterval: kHoverDelaySeconds, repeats: false) { [weak self] _ in
+			MainActor.assumeIsolated {
+				self?.showHoverOverlay(inRow: vRow, inColumn: vColumn)
+			}
+		}
+	}
+
+	// shows the full text if that cell is still hovered and cut off
+	private func showHoverOverlay(inRow: Int, inColumn: Int) {
+		guard let vCurrent = hoveredCell, vCurrent.row == inRow, vCurrent.column == inColumn,
+			  let vWindow = window, vWindow.isKeyWindow || vWindow.isMainWindow,
+			  let vCell = view(atColumn: inColumn, row: inRow, makeIfNecessary: false) as? ResultCellView,
+			  vCell.isTruncated, let vFrame = vCell.labelScreenFrame
+		else {
+			HoverOverlay.shared.hide()
+			return
+		}
+		// updated in place when already shown (no flicker on reloads)
+		HoverOverlay.shared.show(inText: vCell.overlayText(), inFrame: vFrame, inParent: vWindow)
+	}
+
+	// after a reload: redraw the overlay for the still-hovered cell (its
+	// content may have changed), or hide it if that text now fits
+	func refreshHover() {
+		guard let vCurrent = hoveredCell, hoverTimer?.isValid != true else { return }
+		layoutSubtreeIfNeeded()
+		showHoverOverlay(inRow: vCurrent.row, inColumn: vCurrent.column)
+	}
+
+	// cancels the pending overlay and hides the shown one
+	func endHover() {
+		hoverTimer?.invalidate()
+		hoverTimer = nil
+		hoveredCell = nil
+		HoverOverlay.shared.hide()
+	}
+
+	// pointer left the table
+	override func mouseExited(with inEvent: NSEvent) {
+		super.mouseExited(with: inEvent)
+		endHover()
+	}
+
+	// scrolling moves the rows under the overlay: hide it
+	override func scrollWheel(with inEvent: NSEvent) {
+		endHover()
+		super.scrollWheel(with: inEvent)
+	}
+
+	// a click dismisses the overlay
+	override func mouseDown(with inEvent: NSEvent) {
+		endHover()
+		super.mouseDown(with: inEvent)
+	}
+
+	// leaving the window (closed / moved) dismisses the overlay
+	override func viewWillMove(toWindow inWindow: NSWindow?) {
+		endHover()
+		super.viewWillMove(toWindow: inWindow)
+	}
+
 	// Space / Return / ⌘Return / ⌘Y / ⌥⌘C / ⌘⌫; everything else (arrows,
 	// type-select, ⌘A) goes to NSTableView
 	override func keyDown(with inEvent: NSEvent) {
+		endHover()
 		let vMods = inEvent.modifierFlags.intersection([.command, .option, .shift, .control])
 		let vChars = inEvent.charactersIgnoringModifiers?.lowercased() ?? ""
 		let vAction: ResultAction?
@@ -438,10 +534,9 @@ final class ResultCellView: NSTableCellView {
 		vLabel.translatesAutoresizingMaskIntoConstraints = false
 		vLabel.lineBreakMode = .byTruncatingTail
 		vLabel.cell?.usesSingleLineMode = true
-		// hovering a cut-off name / path shows the full text right away,
-		// drawn over the cell (Finder's expansion tooltip), instead of a
-		// help tag that waits for the tooltip delay
-		vLabel.allowsExpansionToolTips = true
+		// the full text of a cut-off cell comes from HoverOverlay (shown by
+		// the table after a short hover), not AppKit's expansion tooltip
+		vLabel.allowsExpansionToolTips = false
 		addSubview(vLabel)
 		textField = vLabel
 		if inWithIcon {
@@ -492,14 +587,15 @@ final class ResultCellView: NSTableCellView {
 		let vColor: NSColor = vEmphasized
 			? .alternateSelectedControlTextColor
 			: (isSecondary ? .secondaryLabelColor : .labelColor)
-		let vFont = NSFont.systemFont(ofSize: NSFont.systemFontSize)
-		if terms.isEmpty {
-			vLabel.font = isSecondary ? NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) : vFont
-			vLabel.textColor = vColor
-			vLabel.stringValue = text
-			return
-		}
-		let vString = NSMutableAttributedString(string: text, attributes: [.font: vFont, .foregroundColor: vColor])
+		vLabel.attributedStringValue = styledText(inColor: vColor)
+	}
+
+	// the text in the cell's fonts, bold where the terms match
+	private func styledText(inColor: NSColor) -> NSAttributedString {
+		let vFont = isSecondary && terms.isEmpty
+			? NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+			: NSFont.systemFont(ofSize: NSFont.systemFontSize)
+		let vString = NSMutableAttributedString(string: text, attributes: [.font: vFont, .foregroundColor: inColor])
 		let vBold = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)
 		let vNs = text as NSString
 		for vTerm in terms {
@@ -512,7 +608,96 @@ final class ResultCellView: NSTableCellView {
 				vSearch = NSRange(location: vNext, length: vNs.length - vNext)
 			}
 		}
-		vLabel.attributedStringValue = vString
+		return vString
+	}
+
+	// true when the text doesn't fit and is shown cut off
+	var isTruncated: Bool {
+		guard let vLabel = textField else { return false }
+		let vAvailable = bounds.width - vLabel.frame.minX - 2
+		return styledText(inColor: .labelColor).size().width + 4 > vAvailable
+	}
+
+	// the full text for the hover overlay, in normal (unselected) colors
+	func overlayText() -> NSAttributedString {
+		return styledText(inColor: isSecondary ? .secondaryLabelColor : .labelColor)
+	}
+
+	// the label's frame in screen coordinates, where the overlay goes
+	var labelScreenFrame: NSRect? {
+		guard let vLabel = textField, let vWindow = window else { return nil }
+		return vWindow.convertToScreen(vLabel.convert(vLabel.bounds, to: nil))
+	}
+}
+
+// HoverOverlay is the panel showing the full text of a cut-off cell. It
+// ignores the mouse, so it can't take the hover away from the table (the
+// built-in expansion tooltip vanished when the pointer touched it), and it
+// floats exactly over the cell's text.
+@MainActor
+final class HoverOverlay {
+
+	// shared overlay (only one cell is hovered at a time)
+	static let shared = HoverOverlay()
+
+	// the borderless panel, created on first use
+	private var panel: NSPanel?
+	// the label inside the panel
+	private let label = NSTextField(labelWithString: "")
+	// padding between the panel edge and the text
+	private let kPadding = NSSize(width: 4, height: 1)
+
+	// shows inText over inFrame (screen coordinates) of inParent's window
+	func show(inText: NSAttributedString, inFrame: NSRect, inParent: NSWindow) {
+		let vPanel = panel ?? makePanel()
+		label.attributedStringValue = inText
+		let vTextSize = inText.size()
+		var vFrame = NSRect(
+			x: inFrame.minX - kPadding.width,
+			y: inFrame.midY - (vTextSize.height / 2) - kPadding.height,
+			width: ceil(vTextSize.width) + kPadding.width * 2 + 4,
+			height: ceil(vTextSize.height) + kPadding.height * 2
+		)
+		// keep it on screen: shift left when it would run past the edge
+		if let vScreen = inParent.screen?.visibleFrame, vFrame.maxX > vScreen.maxX {
+			vFrame.origin.x = max(vScreen.minX, vScreen.maxX - vFrame.width)
+		}
+		vPanel.setFrame(vFrame, display: true)
+		label.frame = NSRect(x: kPadding.width, y: kPadding.height, width: vFrame.width - kPadding.width * 2, height: ceil(vTextSize.height))
+		if vPanel.parent !== inParent {
+			vPanel.parent?.removeChildWindow(vPanel)
+			inParent.addChildWindow(vPanel, ordered: .above)
+		}
+		vPanel.orderFront(nil)
+	}
+
+	// hides the overlay
+	func hide() {
+		guard let vPanel = panel, vPanel.isVisible else { return }
+		vPanel.parent?.removeChildWindow(vPanel)
+		vPanel.orderOut(nil)
+	}
+
+	// builds the panel: borderless, tooltip-like background, click-through
+	private func makePanel() -> NSPanel {
+		let vPanel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+		vPanel.isOpaque = false
+		vPanel.backgroundColor = .clear
+		vPanel.hasShadow = true
+		vPanel.ignoresMouseEvents = true
+		vPanel.level = .floating
+		let vBackground = NSVisualEffectView()
+		vBackground.material = .toolTip
+		vBackground.state = .active
+		vBackground.wantsLayer = true
+		vBackground.layer?.cornerRadius = 4
+		vBackground.layer?.borderWidth = 0.5
+		vBackground.layer?.borderColor = NSColor.separatorColor.cgColor
+		vPanel.contentView = vBackground
+		label.lineBreakMode = .byClipping
+		vBackground.addSubview(label)
+		panel = vPanel
+		return vPanel
 	}
 }
 

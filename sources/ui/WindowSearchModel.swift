@@ -67,7 +67,10 @@ final class WindowSearchModel: ObservableObject {
 	// true while this model's window is on screen (not closed, minimized
 	// or fully covered)
 	private var isWindowVisible = true
-	// true when the index changed while the window was not visible
+	// true while the user holds the freeze key (⌥ Option)
+	private var isFrozen = false
+	// true when the index changed while the window was not visible or
+	// the list was frozen
 	private var isStale = false
 	// true while a throttled index refilter is waiting to run
 	private var isIndexRefreshScheduled = false
@@ -86,6 +89,13 @@ final class WindowSearchModel: ObservableObject {
 				self?.indexDidChange()
 			}
 			.store(in: &cancellables)
+		// holding ⌥ freezes the list; releasing it catches up once
+		FreezeKey.shared.$isHeld
+			.removeDuplicates()
+			.sink { [weak self] vHeld in
+				self?.setFrozen(vHeld)
+			}
+			.store(in: &cancellables)
 		scheduleFilter(inDelay: 0)
 	}
 
@@ -93,9 +103,20 @@ final class WindowSearchModel: ObservableObject {
 	// changed while the window was off screen
 	func setWindowVisible(_ inVisible: Bool) {
 		isWindowVisible = inVisible
-		if inVisible && isStale {
+		if inVisible && isStale && !isFrozen {
 			isStale = false
 			scheduleFilter(inDelay: 0)
+		}
+	}
+
+	// freeze key pressed / released: while frozen, index changes don't
+	// touch the list; on release it is refreshed once, keeping the scroll
+	// position (no quick partial list)
+	private func setFrozen(_ inFrozen: Bool) {
+		isFrozen = inFrozen
+		if !inFrozen && isStale && isWindowVisible {
+			isStale = false
+			scheduleFilter(inDelay: 0, inProgressive: false)
 		}
 	}
 
@@ -129,7 +150,7 @@ final class WindowSearchModel: ObservableObject {
 	// refilter reads the newest records when it runs, so skipped
 	// notifications lose nothing.
 	private func indexDidChange() {
-		guard isWindowVisible else {
+		guard isWindowVisible && !isFrozen else {
 			isStale = true
 			return
 		}
@@ -147,7 +168,7 @@ final class WindowSearchModel: ObservableObject {
 		DispatchQueue.main.asyncAfter(deadline: .now() + vWait) { [weak self] in
 			guard let vSelf = self else { return }
 			vSelf.isIndexRefreshScheduled = false
-			guard vSelf.isWindowVisible else {
+			guard vSelf.isWindowVisible && !vSelf.isFrozen else {
 				vSelf.isStale = true
 				return
 			}

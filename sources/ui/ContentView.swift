@@ -243,6 +243,8 @@ private struct StatusBarView: View {
 	let selectionText: String?
 	// process memory / CPU sampler shared by all windows
 	@ObservedObject private var process = ProcessStats.shared
+	// freeze key state, shown while held
+	@ObservedObject private var freeze = FreezeKey.shared
 
 	// CPU use above which the figure is highlighted (100 = one core)
 	private let kBusyCpuPercent: Double = 50
@@ -265,6 +267,11 @@ private struct StatusBarView: View {
 				}
 			}
 			Spacer()
+			if freeze.isHeld {
+				Label("Frozen", systemImage: "snowflake")
+					.foregroundColor(.accentColor)
+					.help("Holding ⌥ Option pauses list updates; release to catch up")
+			}
 			HStack(spacing: 6) {
 				Text(String(format: "%.0f ms", stats.lastSearchMilliseconds))
 				Text("·")

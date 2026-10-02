@@ -25,6 +25,7 @@ All notable changes to Allofit are documented here.
   | ⌘⌫ | Move to Trash |
 
 - **Context menu:** Open With (default app first), Copy, Copy Name, Copy Path, Move to Trash, and Authorize Access… for files you can't read.
+- **Freeze the list:** hold ⌥ Option to stop background updates from moving rows while you read or select; releasing it catches up once. The status bar shows "Frozen" meanwhile.
 - **Column options:** right-click the column header to show or hide columns. Column order, width and visibility are remembered.
 - **Status bar:**
   - The last search time, Allofit's memory and CPU use, and the selection count and size ("3 selected (12 MB)").
@@ -36,7 +37,7 @@ All notable changes to Allofit are documented here.
 - **High CPU use with a path search open.** An open window searching with a `/` term re-ran the whole search on every file change and could keep several CPU cores busy. Path searches are also about three times faster.
 - **Dragging files into a browser** opened the file in place of the web page instead of uploading it. Dragged rows now carry real files, like Finder.
 - **Roots under `/tmp`, `/var` or `/etc`** never matched their own entries.
-- **Long names and paths:** hovering a cut-off name or path now shows the full text immediately.
+- **Long names and paths:** hovering a cut-off name or path for half a second shows the full text over the cell, and it stays while you hover, even when the list refreshes.
 
 ### Changed
 

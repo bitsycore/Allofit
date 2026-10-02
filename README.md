@@ -41,10 +41,19 @@ The list shows the first 2,000 results in the chosen order; the status bar shows
 
 | Key | Action |
 |---|---|
+| ⌥Space | Show / hide Allofit from any app (changeable in Settings) |
 | ⌘F | Focus search |
-| ⌘R | Reindex |
-| ⌘, | Preferences |
-| ↑ ↓ | Cycle search history |
+| ↑ ↓ (in the search field) | Cycle search history |
+| Return | Open the selection (or reveal it, see Settings) |
+| ⌘Return | Reveal in Finder |
+| Space / ⌘Y | Quick Look |
+| ⌘C / ⌥⌘C | Copy the files / their paths |
+| ⌘⌫ | Move to Trash |
+| Hold ⌥ | Freeze the list: no background updates until released |
+| ⇧⌘R | Rebuild the index |
+| ⌘, | Settings |
+
+Hovering a cut-off name or path for half a second shows it in full. In Finder, right-click a folder → Quick Actions → **Search in Allofit** to search inside it.
 
 ## Background service (optional)
 
