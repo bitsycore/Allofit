@@ -296,6 +296,14 @@ private struct StatusBarView: View {
 					Text("·")
 					Text(vSelection)
 				}
+				// a root folder being indexed for the first time
+				if !model.scans.isEmpty {
+					Text("·")
+					ProgressView()
+						.controlSize(.small)
+					Text(scanText)
+						.help(model.scans.map { $0.path }.joined(separator: "\n"))
+				}
 			}
 			Spacer()
 			if freeze.isHeld {
@@ -314,12 +322,22 @@ private struct StatusBarView: View {
 				Text(roleText)
 			}
 			.monospacedDigit()
-			.help(detailsText)
+			// details after a short hover, updated live (see HoverDetailsAnchor)
+			.background(HoverDetailsAnchor(text: detailsText))
 		}
 		.padding(.horizontal, 12)
 		.padding(.vertical, 4)
 		.font(.caption)
 		.foregroundColor(.secondary)
+	}
+
+	// "Indexing Spirtech2k… 12,345 found" (or "Indexing 2 folders…")
+	private var scanText: String {
+		let vFound = model.scans.reduce(0) { $0 + $1.found }.formatted()
+		if model.scans.count == 1, let vScan = model.scans.first {
+			return "Indexing \(vScan.name)… \(vFound) found"
+		}
+		return "Indexing \(model.scans.count) folders… \(vFound) found"
 	}
 
 	// "N results · M indexed"

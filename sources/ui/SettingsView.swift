@@ -224,7 +224,11 @@ private struct RootsTab: View {
 			Text("Root folders to index")
 				.font(.headline)
 			List(prefs.rootPaths, id: \.self, selection: $selection) { vPath in
-				Text(vPath)
+				HStack {
+					Text(vPath)
+					Spacer()
+					rootStatus(for: vPath)
+				}
 			}
 			.frame(minHeight: 200)
 
@@ -246,6 +250,27 @@ private struct RootsTab: View {
 			Text("In built-in mode, changes apply automatically: new folders are scanned and removed ones dropped from the index. With a service, they apply when the service restarts; Reindex now stops the daemon, deletes its cache, and restarts it so the fresh process re-scans from scratch.")
 				.font(.caption)
 				.foregroundColor(.secondary)
+		}
+	}
+
+	// state shown next to a root: being indexed (with the count found so
+	// far), or unreachable (e.g. a network share that isn't mounted)
+	@ViewBuilder
+	private func rootStatus(for inPath: String) -> some View {
+		let vCanonical = VolumeManager.canonicalPath(inPath: inPath)
+		if let vScan = model.scans.first(where: { $0.path == vCanonical }) {
+			HStack(spacing: 6) {
+				ProgressView()
+					.controlSize(.small)
+				Text("Indexing… \(vScan.found.formatted()) found")
+					.font(.caption)
+					.foregroundColor(.secondary)
+			}
+		} else if !FileManager.default.fileExists(atPath: inPath) {
+			Text("Not available")
+				.font(.caption)
+				.foregroundColor(.orange)
+				.help("This folder can't be reached right now (an unmounted drive or network share?). Its entries stay searchable until it's removed.")
 		}
 	}
 

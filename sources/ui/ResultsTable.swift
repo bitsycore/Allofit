@@ -437,6 +437,12 @@ final class ResultsNSTableView: NSTableView {
 
 	// shows the full text if that cell is still hovered and cut off
 	private func showHoverOverlay(inRow: Int, inColumn: Int) {
+		// the list may have shrunk since the pointer settled on this cell;
+		// NSTableView raises (and the app aborts) on an out-of-range row
+		guard inRow >= 0, inRow < numberOfRows, inColumn >= 0, inColumn < numberOfColumns else {
+			endHover()
+			return
+		}
 		guard let vCurrent = hoveredCell, vCurrent.row == inRow, vCurrent.column == inColumn,
 			  let vWindow = window, vWindow.isKeyWindow || vWindow.isMainWindow,
 			  let vCell = view(atColumn: inColumn, row: inRow, makeIfNecessary: false) as? ResultCellView,
@@ -452,9 +458,16 @@ final class ResultsNSTableView: NSTableView {
 	// after a reload: redraw the overlay for the still-hovered cell (its
 	// content may have changed), or hide it if that text now fits
 	func refreshHover() {
-		guard let vCurrent = hoveredCell, hoverTimer?.isValid != true else { return }
-		layoutSubtreeIfNeeded()
-		showHoverOverlay(inRow: vCurrent.row, inColumn: vCurrent.column)
+		guard hoveredCell != nil, hoverTimer?.isValid != true else { return }
+		// runs after the current update pass: this is called from SwiftUI's
+		// updateNSView, often in the middle of a layout / constraints pass,
+		// where asking the table for cell views (or forcing a layout) is
+		// unsafe. The hovered cell is re-checked then (the reload may have
+		// removed its row).
+		DispatchQueue.main.async { [weak self] in
+			guard let vSelf = self, let vCurrent = vSelf.hoveredCell, vSelf.hoverTimer?.isValid != true else { return }
+			vSelf.showHoverOverlay(inRow: vCurrent.row, inColumn: vCurrent.column)
+		}
 	}
 
 	// listens for ↓ in the search field of the same window
@@ -714,6 +727,39 @@ final class HoverOverlay {
 		vPanel.orderFront(nil)
 	}
 
+	// shows multi-line details (plain text) just above inAnchor (screen
+	// coordinates), right-aligned with it and kept on screen
+	func showDetails(inText: String, inAnchor: NSRect, inParent: NSWindow) {
+		let vPanel = panel ?? makePanel()
+		let vText = NSAttributedString(string: inText, attributes: [
+			.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+			.foregroundColor: NSColor.labelColor
+		])
+		label.attributedStringValue = vText
+		let vPad = NSSize(width: 8, height: 6)
+		let vTextSize = vText.boundingRect(
+			with: NSSize(width: 10_000, height: 10_000),
+			options: [.usesLineFragmentOrigin, .usesFontLeading]
+		).size
+		var vFrame = NSRect(
+			x: inAnchor.maxX - ceil(vTextSize.width) - vPad.width * 2,
+			y: inAnchor.maxY + 4,
+			width: ceil(vTextSize.width) + vPad.width * 2,
+			height: ceil(vTextSize.height) + vPad.height * 2
+		)
+		if let vScreen = inParent.screen?.visibleFrame {
+			vFrame.origin.x = min(max(vFrame.minX, vScreen.minX), vScreen.maxX - vFrame.width)
+			vFrame.origin.y = min(vFrame.minY, vScreen.maxY - vFrame.height)
+		}
+		vPanel.setFrame(vFrame, display: true)
+		label.frame = NSRect(x: vPad.width, y: vPad.height, width: ceil(vTextSize.width) + 2, height: ceil(vTextSize.height))
+		if vPanel.parent !== inParent {
+			vPanel.parent?.removeChildWindow(vPanel)
+			inParent.addChildWindow(vPanel, ordered: .above)
+		}
+		vPanel.orderFront(nil)
+	}
+
 	// hides the overlay
 	func hide() {
 		guard let vPanel = panel, vPanel.isVisible else { return }
@@ -738,6 +784,8 @@ final class HoverOverlay {
 		vBackground.layer?.borderColor = NSColor.separatorColor.cgColor
 		vPanel.contentView = vBackground
 		label.lineBreakMode = .byClipping
+		label.maximumNumberOfLines = 0
+		label.usesSingleLineMode = false
 		vBackground.addSubview(label)
 		panel = vPanel
 		return vPanel
@@ -786,6 +834,105 @@ final class HeaderMenuStates: NSObject, NSMenuDelegate {
 		for vItem in inMenu.items {
 			if let vColumn = vItem.representedObject as? NSTableColumn {
 				vItem.state = vColumn.isHidden ? .off : .on
+			}
+		}
+	}
+}
+
+// HoverDetailsAnchor shows a multi-line details text in HoverOverlay after
+// the pointer rests on its area for kDelaySeconds, keeps it while hovered and
+// updates it in place when the text changes. A help tag (.help) restarts its
+// delay every time its text changes, so on a status bar refreshing every
+// second or two it appeared late or not at all.
+struct HoverDetailsAnchor: NSViewRepresentable {
+
+	// the details to show (re-evaluated by SwiftUI on each refresh)
+	let text: String
+
+	// hover delay, same as the result cells' overlay
+	static let kDelaySeconds: TimeInterval = 0.5
+
+	// creates the tracking view
+	func makeNSView(context inContext: Context) -> AnchorView {
+		let vView = AnchorView(frame: .zero)
+		vView.text = text
+		return vView
+	}
+
+	// passes the latest text; a visible overlay is updated in place
+	func updateNSView(_ inView: AnchorView, context inContext: Context) {
+		inView.text = text
+	}
+
+	// AnchorView tracks the pointer over its bounds; clicks pass through
+	final class AnchorView: NSView {
+
+		// latest details text
+		var text = "" {
+			didSet {
+				if isShowing && text != oldValue { show() }
+			}
+		}
+		// pending display after the hover delay
+		private var timer: Timer?
+		// true while this anchor's details are on screen
+		private var isShowing = false
+
+		// follows the pointer over the visible part of the view
+		override func updateTrackingAreas() {
+			super.updateTrackingAreas()
+			for vArea in trackingAreas where vArea.owner === self {
+				removeTrackingArea(vArea)
+			}
+			addTrackingArea(NSTrackingArea(
+				rect: .zero,
+				options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+				owner: self,
+				userInfo: nil
+			))
+		}
+
+		// starts the hover delay
+		override func mouseEntered(with inEvent: NSEvent) {
+			timer?.invalidate()
+			timer = Timer.scheduledTimer(withTimeInterval: HoverDetailsAnchor.kDelaySeconds, repeats: false) { [weak self] _ in
+				MainActor.assumeIsolated {
+					self?.show()
+				}
+			}
+		}
+
+		// pointer left: cancel or hide
+		override func mouseExited(with inEvent: NSEvent) {
+			dismiss()
+		}
+
+		// never takes clicks (the status bar text stays selectable / inert)
+		override func hitTest(_ inPoint: NSPoint) -> NSView? {
+			return nil
+		}
+
+		// leaving the window hides the details
+		override func viewWillMove(toWindow inWindow: NSWindow?) {
+			dismiss()
+			super.viewWillMove(toWindow: inWindow)
+		}
+
+		// shows (or refreshes) the details above the anchor
+		private func show() {
+			guard let vWindow = window, !text.isEmpty else { return }
+			let vFrame = vWindow.convertToScreen(convert(bounds, to: nil))
+			HoverOverlay.shared.showDetails(inText: text, inAnchor: vFrame, inParent: vWindow)
+			isShowing = true
+		}
+
+		// cancels a pending display and hides a shown one
+		private func dismiss() {
+			timer?.invalidate()
+			timer = nil
+			if isShowing {
+				isShowing = false
+				HoverOverlay.shared.hide()
 			}
 		}
 	}

@@ -150,10 +150,15 @@ struct IndexState {
 			let vIsRoot = inRoots.contains(vRecord.fullPath)
 			guard vIsRoot || contains(inPath: vRecord.parentPath) else { continue }
 			let vIsNew = positions[vRecord.id] == nil
-			if upsert(vRecord) { vChanged = true }
+			// a folder that just appeared is not added here: its walk adds
+			// it (with its contents) once complete. Until then it looks
+			// missing, so an interrupted walk is redone on the next launch
+			// or replay instead of leaving a folder with partial contents.
 			if vIsNew && vRecord.isDirectory {
 				vNewFolders.append(vRecord.fullPath)
+				continue
 			}
+			if upsert(vRecord) { vChanged = true }
 		}
 
 		// kernel rescans only for subtrees that belong to the index

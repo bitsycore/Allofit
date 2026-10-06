@@ -93,6 +93,10 @@ struct IndexStateTests {
 		#expect(vResult.rescans.isEmpty)
 		#expect(vState.contains(inPath: "/r/a/new.txt"))
 		#expect(!vState.contains(inPath: "/r/hidden/x.txt"))
+		// the new folder and its content come from its walk, merged at once
+		#expect(!vState.contains(inPath: "/r/moved"))
+		#expect(!vState.contains(inPath: "/r/moved/inside.txt"))
+		vState.mergeNewFolders(inRecords: [Self.dir("/r/moved"), Self.file("/r/moved/inside.txt")])
 		#expect(vState.contains(inPath: "/r/moved/inside.txt"))
 	}
 

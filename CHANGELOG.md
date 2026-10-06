@@ -2,6 +2,23 @@
 
 All notable changes to Allofit are documented here.
 
+## [1.0.10] - 2026-10-06
+
+### Fixed
+
+- **Crash** when the results list changed while the pointer rested on a cut-off name or path (for example right after adding a folder): the hover overlay read a row that no longer existed.
+- **Status bar details** appeared late or not at all, because the help tag restarted its delay at every refresh. They now show 0.5 s after hovering and update live.
+
+### Added
+
+- **Indexing progress for new folders:** while a folder is indexed for the first time, the status bar shows "Indexing <folder>… N found", and Settings → Indexes → Folders shows the progress next to it, or "Not available" when the folder can't be reached (an unmounted drive or share).
+
+### Changed
+
+- **Large new folders** (a network share, an external drive) show their files as they are found, every few seconds, instead of only at the end of the walk.
+- **Walks no longer delay live updates:** reading a big new folder runs separately, so changes elsewhere keep appearing.
+- **Interrupted walks are redone:** a new folder only counts as indexed once its walk is complete, so quitting mid-walk resumes it on the next launch instead of leaving it half indexed.
+
 ## [1.0.9] - 2026-10-02
 
 ### Added

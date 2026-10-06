@@ -123,6 +123,22 @@ final class AppModel: ObservableObject {
 	@Published private(set) var isLoadingCache: Bool = false
 	// true when this process owns the index (got the lock or built-in mode)
 	@Published private(set) var isIndexer: Bool = false
+	// root folders being indexed for the first time (or re-read entirely),
+	// with how many entries were found so far: shown in the status bar and
+	// next to the folder in Settings
+	@Published private(set) var scans: [ScanProgress] = []
+
+	// one announced walk of a root folder
+	struct ScanProgress: Identifiable, Equatable {
+		// canonical path of the folder being walked
+		let path: String
+		// entries found so far
+		var found: Int
+		// identity for SwiftUI lists
+		var id: String { path }
+		// folder name for display ("Spirtech2k")
+		var name: String { (path as NSString).lastPathComponent }
+	}
 
 	// how often the index is written to disk while running (seconds)
 	private let kAutosaveSeconds: TimeInterval = 30
@@ -133,6 +149,12 @@ final class AppModel: ObservableObject {
 	// background queues isolated by concern - keeps the slow stuff off main
 	private let indexQueue = DispatchQueue(label: "allofit.index", qos: .utility)
 	private let ioQueue = DispatchQueue(label: "allofit.io", qos: .utility)
+	// subtree walks (new roots, new or rescanned folders): separate from
+	// indexQueue so a long walk never delays live updates
+	private let walkQueue = DispatchQueue(label: "allofit.walk", qos: .utility)
+	// while walking a new root or folder, what's found so far is added to
+	// the index this often
+	private let kWalkStreamSeconds: TimeInterval = 3
 	// watcher used in indexer mode for live updates
 	private let watcher = FileWatcher()
 	// watcher used in reader mode to detect cache file refreshes
@@ -581,14 +603,15 @@ final class AppModel: ObservableObject {
 			lastEventId = vCurrentId
 			startWatching(inSinceWhen: vCurrentId)
 			// floor 0: an interrupted walk makes the next launch start over
-			kickRescanSubtrees(inPaths: vRoots, inFloorEventId: 0)
+			kickRescanSubtrees(inPaths: vRoots, inFloorEventId: 0, inAnnounce: true)
 			return
 		}
 		startWatching(inSinceWhen: lastEventId)
 		// roots added since the cache was written have never been walked
 		let vMissing = vRoots.filter { !index.contains(inPath: $0) }
 		if !vMissing.isEmpty {
-			kickRescanSubtrees(inPaths: vMissing, inFloorEventId: lastEventId)
+			// nothing below a missing root is indexed: stream it in
+			kickRescanSubtrees(inPaths: vMissing, inFloorEventId: lastEventId, inNewFolders: true, inAnnounce: true)
 		}
 	}
 
@@ -700,44 +723,97 @@ final class AppModel: ObservableObject {
 	// inFloorEventId is saved instead of lastEventId until the walk is
 	// merged. inNewFolders: the folders just appeared, so their records are
 	// merged without the O(n) removal pass of a kernel-requested rescan.
-	private func kickRescanSubtrees(inPaths: [String], inFloorEventId: UInt64, inNewFolders: Bool = false) {
+	// inAnnounce lists the walk in `scans` (root folders only: the small
+	// folders appearing all the time would make the status bar flicker)
+	private func kickRescanSubtrees(inPaths: [String], inFloorEventId: UInt64, inNewFolders: Bool = false, inAnnounce: Bool = false) {
 		let vRoots = SubtreeMatcher.minimalRoots(inPaths: inPaths)
 		guard !vRoots.isEmpty else { return }
+		if inAnnounce {
+			for vRoot in vRoots where !scans.contains(where: { $0.path == vRoot }) {
+				scans.append(ScanProgress(path: vRoot, found: 0))
+			}
+		}
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		let vGeneration = indexGeneration
 		rescanFloorEventId = min(rescanFloorEventId ?? inFloorEventId, inFloorEventId)
 		rescansInFlight += 1
-		indexQueue.async { [weak self] in
+		let vStreamSeconds = kWalkStreamSeconds
+		// own queue: a long walk (a whole network share) must not hold up
+		// the FSEvents updates resolved on indexQueue
+		walkQueue.async { [weak self] in
 			var vRecords: [FileRecord] = []
+			var vLastStream = Date()
+			var vLastProgress = Date()
+			// the walked folders' own entries are only merged at the very end,
+			// so an interrupted walk leaves them "missing" and gets redone
+			let vRootIds = Set(vRoots.map { FileRecord.pathHash($0) })
+			var vHeldRoots: [FileRecord] = []
 			for vPath in vRoots {
+				var vFound = 0
 				// per-subtree autoreleasepool keeps the walk's autoreleased
 				// URL/stat objects from accumulating across subtrees
 				autoreleasepool {
-					vRecords.append(contentsOf: FileIndexer.indexRoot(
-						inRoot: URL(fileURLWithPath: vPath),
-						inExclusions: vMatcher
-					))
+					FileIndexer.walkRoot(inRoot: URL(fileURLWithPath: vPath), inExclusions: vMatcher) { vBatch in
+						vRecords.append(contentsOf: vBatch)
+						vFound += vBatch.count
+						if inAnnounce && Date().timeIntervalSince(vLastProgress) >= 0.5 {
+							vLastProgress = Date()
+							let vCount = vFound
+							DispatchQueue.main.async {
+								self?.updateScan(inPath: vPath, inFound: vCount)
+							}
+						}
+						// new folders / roots: nothing below them is indexed
+						// yet, so what's found so far can be shown right away
+						guard inNewFolders, Date().timeIntervalSince(vLastStream) >= vStreamSeconds else { return }
+						vLastStream = Date()
+						vHeldRoots.append(contentsOf: vRecords.filter { vRootIds.contains($0.id) })
+						let vChunk = vRecords.filter { !vRootIds.contains($0.id) }
+						vRecords = []
+						DispatchQueue.main.async {
+							self?.mergeWalked(inRecords: vChunk, inGeneration: vGeneration)
+						}
+					}
 				}
 			}
-			let vFinal = vRecords
+			let vFinal = vRecords + vHeldRoots
 			DispatchQueue.main.async {
 				guard let vSelf = self else { return }
+				if inAnnounce {
+					vSelf.scans.removeAll { vRoots.contains($0.path) }
+				}
 				vSelf.rescansInFlight -= 1
 				if vSelf.rescansInFlight <= 0 {
 					vSelf.rescansInFlight = 0
 					vSelf.rescanFloorEventId = nil
 				}
-				guard vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
 				if inNewFolders {
-					vSelf.index.mergeNewFolders(inRecords: vFinal)
+					vSelf.mergeWalked(inRecords: vFinal, inGeneration: vGeneration)
 				} else {
+					guard vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
 					vSelf.index.replaceSubtrees(inRoots: vRoots, inRecords: vFinal)
+					vSelf.dirty = true
+					vSelf.publishRecords()
 				}
-				vSelf.dirty = true
-				vSelf.publishRecords()
 			}
 		}
 	}
+
+	// publishes the progress of an announced walk
+	private func updateScan(inPath: String, inFound: Int) {
+		guard let vIndex = scans.firstIndex(where: { $0.path == inPath }) else { return }
+		scans[vIndex].found = inFound
+	}
+
+	// adds walked records below folders that weren't indexed (no removal
+	// pass), unless the index was replaced since the walk started
+	private func mergeWalked(inRecords: [FileRecord], inGeneration: Int) {
+		guard isIndexer, indexGeneration == inGeneration, !inRecords.isEmpty else { return }
+		index.mergeNewFolders(inRecords: inRecords)
+		dirty = true
+		publishRecords()
+	}
+
 
 	// applies edited roots / exclusions / volume options to the live index
 	// without a full reindex: prunes what fell out of scope, walks roots
@@ -767,7 +843,7 @@ final class AppModel: ObservableObject {
 				vSelf.startWatching(inSinceWhen: vSnapshotEventId)
 				let vMissing = vRoots.filter { !vSelf.index.contains(inPath: $0) }
 				if !vMissing.isEmpty {
-					vSelf.kickRescanSubtrees(inPaths: vMissing, inFloorEventId: vSnapshotEventId)
+					vSelf.kickRescanSubtrees(inPaths: vMissing, inFloorEventId: vSnapshotEventId, inNewFolders: true, inAnnounce: true)
 				}
 			}
 		}
