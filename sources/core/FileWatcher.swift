@@ -23,6 +23,12 @@ struct FSChange {
 	var mustScanSubDirs: Bool {
 		return flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0
 	}
+	// true for the notice that a volume was mounted or unmounted at path:
+	// not a change of its files (an unmount doesn't delete anything)
+	var isVolumeEvent: Bool {
+		let vMask = FSEventStreamEventFlags(kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount)
+		return flags & vMask != 0
+	}
 }
 
 // FileWatcher streams real-time filesystem change notifications using FSEvents.

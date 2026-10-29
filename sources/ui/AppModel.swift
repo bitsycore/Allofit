@@ -127,6 +127,8 @@ final class AppModel: ObservableObject {
 	// with how many entries were found so far: shown in the status bar and
 	// next to the folder in Settings
 	@Published private(set) var scans: [ScanProgress] = []
+	// protected roots whose wipe was refused, with when it last happened
+	@Published private(set) var keptRoots: [String: Date] = [:]
 
 	// one announced walk of a root folder
 	struct ScanProgress: Identifiable, Equatable {
@@ -165,6 +167,8 @@ final class AppModel: ObservableObject {
 	private var watchedRoots: Set<String> = []
 	// exclusions the running watcher resolves changes with
 	private var currentExclusions: ExclusionMatcher?
+	// roots and protected roots the running watcher guards (see RootGuard)
+	private var guardConfig: (roots: [String], protected: [String]) = ([], [])
 	// subtree walks started but not merged yet
 	private var rescansInFlight = 0
 	// event id to save while rescans are in flight: the id from before the
@@ -241,14 +245,23 @@ final class AppModel: ObservableObject {
 			self?.activityChanged(inLevel: AppActivity.shared.level)
 		}
 		.store(in: &cancellables)
+		// re-read the roots of a drive or share as soon as it mounts
+		NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)
+			.receive(on: DispatchQueue.main)
+			.sink { [weak self] vNote in
+				guard let vUrl = vNote.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
+				self?.volumeMounted(inPath: VolumeManager.canonicalPath(inPath: vUrl.path))
+			}
+			.store(in: &cancellables)
 		// apply roots / exclusions / volume edits to the live index
-		Publishers.Merge4(
+		Publishers.Merge5(
 			prefs.$rootPaths.map { _ in () },
 			prefs.$excludedPaths.map { _ in () },
 			prefs.$includeMountedVolumes.map { _ in () },
-			prefs.$includeNetworkVolumes.map { _ in () }
+			prefs.$includeNetworkVolumes.map { _ in () },
+			prefs.$protectedRoots.map { _ in () }
 		)
-		.dropFirst(4)
+		.dropFirst(5)
 		.debounce(for: .seconds(kConfigDebounceSeconds), scheduler: DispatchQueue.main)
 		.sink { [weak self] in
 			self?.applyConfigurationChange()
@@ -384,17 +397,25 @@ final class AppModel: ObservableObject {
 		// partial results only when there is nothing to show yet (first
 		// run): a manual rebuild keeps the old index visible until the end
 		let vPublishPartial = index.count == 0
+		// the current entries of a root that can't be read, or of a protected
+		// root the walk would wipe, are kept (see RootGuard)
+		let vOld = index
+		let vProtected = prefs.protectedRoots
 		indexQueue.async { [weak self] in
 			var vAccumulated: [FileRecord] = []
+			var vSpared: [String] = []
 			// the results fill in while the walk runs (instead of an empty
 			// window until the end of a scan that can take minutes)
 			let kPartialPublishSeconds: TimeInterval = 3
 			var vLastPublish = Date()
+			let vGuard = RootGuard.current(inRoots: vRoots.map { $0.path }, inProtected: vProtected)
 			for vRoot in vRoots {
+				let vStart = vAccumulated.count
 				// per-root autoreleasepool so the file-enumeration's
 				// autoreleased NSURL/NSDate/NSNumber objects don't pile
 				// up across roots inside this long-running async block
 				autoreleasepool {
+					if vGuard.isOffline(inPath: vRoot.path) { return }
 					FileIndexer.walkRoot(inRoot: vRoot, inExclusions: vMatcher) { vBatch in
 						vAccumulated.append(contentsOf: vBatch)
 						let vCount = vAccumulated.count
@@ -411,6 +432,17 @@ final class AppModel: ObservableObject {
 						}
 					}
 				}
+				// unmounted (now or during the walk), or about to be wiped
+				let vOldCount = vOld.count(inRoot: vRoot.path)
+				let vIsOffline = !VolumeManager.isReachable(inPath: vRoot.path)
+				let vIsWipe = vGuard.protectedRoot(of: vRoot.path) != nil
+					&& RootGuard.isWipe(inBefore: vOldCount, inAfter: vAccumulated.count - vStart)
+				if vOldCount > 0 && (vIsOffline || vIsWipe) {
+					let vRootMatcher = SubtreeMatcher(inRoots: [vRoot.path])
+					vAccumulated.removeSubrange(vStart...)
+					vAccumulated.append(contentsOf: vOld.records.filter { vRootMatcher.covers(inRecord: $0) })
+					if vIsWipe { vSpared.append(vRoot.path) }
+				}
 			}
 			let vState = IndexState(inRecords: vAccumulated)
 			// persist off-main (on the save queue, so it never races another
@@ -419,6 +451,7 @@ final class AppModel: ObservableObject {
 				IndexStore.save(inRecords: vState.records, inLastEventId: vStartId)
 			}
 			DispatchQueue.main.async {
+				self?.noteKept(inRoots: vSpared)
 				self?.applyFreshIndex(inState: vState, inEventId: vStartId)
 			}
 		}
@@ -608,7 +641,8 @@ final class AppModel: ObservableObject {
 		}
 		startWatching(inSinceWhen: lastEventId)
 		// roots added since the cache was written have never been walked
-		let vMissing = vRoots.filter { !index.contains(inPath: $0) }
+		// (an unmounted one is walked when its volume mounts)
+		let vMissing = vRoots.filter { !index.contains(inPath: $0) && VolumeManager.isReachable(inPath: $0) }
 		if !vMissing.isEmpty {
 			// nothing below a missing root is indexed: stream it in
 			kickRescanSubtrees(inPaths: vMissing, inFloorEventId: lastEventId, inNewFolders: true, inAnnounce: true)
@@ -627,28 +661,35 @@ final class AppModel: ObservableObject {
 		let vQueue = indexQueue
 		let vMatcher = ExclusionMatcher(inExclusions: prefs.excludedPaths)
 		currentExclusions = vMatcher
+		let vProtected = prefs.protectedRoots
+		guardConfig = (vRoots, vProtected)
 		watcher.start(
 			inRoots: vRoots,
 			inSinceWhen: FSEventStreamEventId(inSinceWhen)
 		) { [weak self] vChanges in
 			guard vPending.append(inChanges: vChanges) else { return }
 			vQueue.asyncAfter(deadline: .now() + vPending.coalesceDelay) { [weak self] in
-				AppModel.flush(inPending: vPending, inExclusions: vMatcher, inModel: self)
+				AppModel.flush(inPending: vPending, inExclusions: vMatcher,
+							   inRoots: vRoots, inProtected: vProtected, inModel: self)
 			}
 		}
 	}
 
 	// resolves everything pending (on the calling background queue) and
-	// merges the result on main
+	// merges the result on main. The roots are checked first, so changes
+	// below an unmounted one are ignored (see RootGuard).
 	private nonisolated static func flush(inPending: PendingChanges,
 										  inExclusions: ExclusionMatcher,
+										  inRoots: [String],
+										  inProtected: [String],
 										  inModel: AppModel?) {
 		let vChanges = inPending.drain()
 		// an early catch-up flush may already have taken everything
 		guard !vChanges.isEmpty else { return }
-		let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: inExclusions)
+		let vGuard = RootGuard.current(inRoots: inRoots, inProtected: inProtected)
+		let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: inExclusions, inGuard: vGuard)
 		DispatchQueue.main.async { [weak inModel] in
-			inModel?.applyResolvedChanges(inResolved: vResolved)
+			inModel?.applyResolvedChanges(inResolved: vResolved, inGuard: vGuard)
 		}
 	}
 
@@ -673,8 +714,10 @@ final class AppModel: ObservableObject {
 		pendingChanges.setCoalesceDelay(vDelay)
 		guard vDelay < vPrevious, isIndexer, pendingChanges.hasPending, let vMatcher = currentExclusions else { return }
 		let vPending = pendingChanges
+		let (vRoots, vProtected) = guardConfig
 		indexQueue.async { [weak self] in
-			AppModel.flush(inPending: vPending, inExclusions: vMatcher, inModel: self)
+			AppModel.flush(inPending: vPending, inExclusions: vMatcher,
+						   inRoots: vRoots, inProtected: vProtected, inModel: self)
 		}
 	}
 
@@ -694,11 +737,12 @@ final class AppModel: ObservableObject {
 
 	// merges a resolved set of FSEvents changes into the index (pure
 	// in-memory work; the stats were done off-main by IndexState.resolve)
-	private func applyResolvedChanges(inResolved: ResolvedChanges) {
+	private func applyResolvedChanges(inResolved: ResolvedChanges, inGuard: RootGuard = RootGuard()) {
 		guard isIndexer else { return }
 		let vEventIdBefore = lastEventId
-		let vResult = index.apply(inChanges: inResolved, inRoots: watchedRoots)
+		let vResult = index.apply(inChanges: inResolved, inRoots: watchedRoots, inGuard: inGuard)
 		lastEventId = max(lastEventId, inResolved.maxEventId)
+		noteKept(inRoots: vResult.spared)
 		if vResult.changed {
 			dirty = true
 			publishRecords()
@@ -738,6 +782,7 @@ final class AppModel: ObservableObject {
 		rescanFloorEventId = min(rescanFloorEventId ?? inFloorEventId, inFloorEventId)
 		rescansInFlight += 1
 		let vStreamSeconds = kWalkStreamSeconds
+		let (vGuardRoots, vProtected) = guardConfig
 		// own queue: a long walk (a whole network share) must not hold up
 		// the FSEvents updates resolved on indexQueue
 		walkQueue.async { [weak self] in
@@ -777,6 +822,8 @@ final class AppModel: ObservableObject {
 				}
 			}
 			let vFinal = vRecords + vHeldRoots
+			// checked after the walk: a share unmounted meanwhile looks empty
+			let vGuard = RootGuard.current(inRoots: vGuardRoots, inProtected: vProtected)
 			DispatchQueue.main.async {
 				guard let vSelf = self else { return }
 				if inAnnounce {
@@ -791,11 +838,46 @@ final class AppModel: ObservableObject {
 					vSelf.mergeWalked(inRecords: vFinal, inGeneration: vGeneration)
 				} else {
 					guard vSelf.isIndexer, vSelf.indexGeneration == vGeneration else { return }
-					vSelf.index.replaceSubtrees(inRoots: vRoots, inRecords: vFinal)
+					let vSpared = vSelf.index.replaceSubtrees(inRoots: vRoots, inRecords: vFinal, inGuard: vGuard)
+					vSelf.noteKept(inRoots: vSpared)
 					vSelf.dirty = true
 					vSelf.publishRecords()
 				}
 			}
+		}
+	}
+
+	// records protected roots whose wipe was just refused
+	private func noteKept(inRoots: [String]) {
+		guard !inRoots.isEmpty else { return }
+		for vRoot in inRoots {
+			NSLog("[Allofit GUI] protected root %@: refused an update that would remove almost all of it", vRoot)
+			keptRoots[vRoot] = Date()
+		}
+	}
+
+	// a volume was mounted: roots on it that are already indexed are
+	// re-read (their files may have changed while it was away, and changes
+	// made from other computers to a share are never reported), and roots
+	// never indexed are walked. The watcher restarts so it covers the volume.
+	private func volumeMounted(inPath: String) {
+		guard isIndexer, !isIndexing, !isLoadingCache else { return }
+		let vRoots = VolumeManager.effectiveRoots(inPreferences: prefs).map { $0.path }
+		let vOnVolume = vRoots.filter {
+			RootGuard.isAtOrBelow(inPath: $0, inRoot: inPath) && VolumeManager.isReachable(inPath: $0)
+		}
+		guard !vOnVolume.isEmpty else { return }
+		NSLog("[Allofit GUI] volume mounted at %@, re-reading %d root(s)", inPath, vOnVolume.count)
+		let vSinceId = rescanFloorEventId ?? lastEventId
+		watcher.stop()
+		startWatching(inSinceWhen: vSinceId)
+		let vKnown = vOnVolume.filter { index.contains(inPath: $0) }
+		let vNew = vOnVolume.filter { !index.contains(inPath: $0) }
+		if !vKnown.isEmpty {
+			kickRescanSubtrees(inPaths: vKnown, inFloorEventId: vSinceId, inAnnounce: true)
+		}
+		if !vNew.isEmpty {
+			kickRescanSubtrees(inPaths: vNew, inFloorEventId: vSinceId, inNewFolders: true, inAnnounce: true)
 		}
 	}
 
@@ -841,7 +923,7 @@ final class AppModel: ObservableObject {
 				vSelf.dirty = true
 				vSelf.lastEventId = vSnapshotEventId
 				vSelf.startWatching(inSinceWhen: vSnapshotEventId)
-				let vMissing = vRoots.filter { !vSelf.index.contains(inPath: $0) }
+				let vMissing = vRoots.filter { !vSelf.index.contains(inPath: $0) && VolumeManager.isReachable(inPath: $0) }
 				if !vMissing.isEmpty {
 					vSelf.kickRescanSubtrees(inPaths: vMissing, inFloorEventId: vSnapshotEventId, inNewFolders: true, inAnnounce: true)
 				}

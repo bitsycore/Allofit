@@ -50,6 +50,7 @@ enum AllofitService {
 		let vRoots = VolumeManager.effectiveRoots(inPreferences: vPrefs).map { $0.path }
 		let vRootSet = Set(vRoots)
 		let vMatcher = ExclusionMatcher(inExclusions: vPrefs.excludedPaths)
+		let vProtected = vPrefs.protectedRoots
 		// log the actual configuration so the user can verify owner-prefs sync
 		// (root daemon reads from /Users/<owner>/Library/Preferences/...)
 		NSLog("[Allofit] roots: %@", vRoots.joined(separator: ", "))
@@ -86,6 +87,8 @@ enum AllofitService {
 		// its own autoreleasepool so the autoreleased NSURL / NSDate /
 		// NSNumber from the enumeration don't pile up until the whole scan
 		// finishes - on a million-file scan that peaked well over a gig.
+		// (an unmounted root is walked by the volume check once it's back)
+		vToScan.removeAll { !VolumeManager.isReachable(inPath: $0) }
 		if !vToScan.isEmpty {
 			for vRoot in vToScan {
 				autoreleasepool {
@@ -123,10 +126,13 @@ enum AllofitService {
 			inSinceWhen: FSEventStreamEventId(vSinceId)
 		) { vChanges in
 			autoreleasepool {
-				// stat() outside the lock so the autosave isn't blocked
-				let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: vMatcher)
+				// stat() outside the lock so the autosave isn't blocked;
+				// changes below an unmounted root are ignored (RootGuard)
+				let vGuard = RootGuard.current(inRoots: vRoots, inProtected: vProtected)
+				let vResolved = IndexState.resolve(inChanges: vChanges, inExclusions: vMatcher, inGuard: vGuard)
 				vState.lock.lock()
-				let vResult = vState.index.apply(inChanges: vResolved, inRoots: vRootSet)
+				let vResult = vState.index.apply(inChanges: vResolved, inRoots: vRootSet, inGuard: vGuard)
+				logKept(inRoots: vResult.spared)
 				if vResult.changed { vState.dirty = true }
 				// with no walk pending the batch is fully merged: advance the
 				// saved event id now; otherwise only once the walks are in,
@@ -148,8 +154,10 @@ enum AllofitService {
 				if !vResult.rescans.isEmpty {
 					NSLog("[Allofit] rescanning %d subtree(s)", vResult.rescans.count)
 					let vFresh = walk(inPaths: vResult.rescans, inExclusions: vMatcher)
+					// checked after the walk: a share unmounted meanwhile looks empty
+					let vAfter = RootGuard.current(inRoots: vRoots, inProtected: vProtected)
 					vState.lock.lock()
-					vState.index.replaceSubtrees(inRoots: vResult.rescans, inRecords: vFresh)
+					logKept(inRoots: vState.index.replaceSubtrees(inRoots: vResult.rescans, inRecords: vFresh, inGuard: vAfter))
 					vState.dirty = true
 					vState.lock.unlock()
 				}
@@ -167,9 +175,50 @@ enum AllofitService {
 			}
 		}
 
+		// drives and shares that come back are read again
+		startVolumeCheck(inState: vState, inRoots: vRoots, inProtected: vProtected, inExclusions: vMatcher)
+
 		// block forever on the runloop so launchd keeps us alive
 		RunLoop.current.run()
 		exit(0)
+	}
+
+	// logs the protected roots whose wipe was just refused
+	private static func logKept(inRoots: [String]) {
+		for vRoot in inRoots {
+			NSLog("[Allofit] protected root %@: refused an update that would remove almost all of it", vRoot)
+		}
+	}
+
+	// checks every kVolumeCheckSeconds which roots can be reached. A root
+	// that comes back (its drive or share was mounted) is walked again: its
+	// files may have changed while it was away, and changes made to a share
+	// from other computers are never reported. Its entries were kept while
+	// it was unreachable (RootGuard), so the walk replaces them.
+	private static func startVolumeCheck(inState: State,
+										 inRoots: [String],
+										 inProtected: [String],
+										 inExclusions: ExclusionMatcher) {
+		let kVolumeCheckSeconds = 10
+		DispatchQueue.global(qos: .utility).async {
+			var vOffline = Set(inRoots.filter { !VolumeManager.isReachable(inPath: $0) })
+			while true {
+				sleep(UInt32(kVolumeCheckSeconds))
+				autoreleasepool {
+					let vNow = Set(inRoots.filter { !VolumeManager.isReachable(inPath: $0) })
+					let vBack = vOffline.subtracting(vNow).sorted()
+					vOffline = vNow
+					guard !vBack.isEmpty else { return }
+					NSLog("[Allofit] root(s) reachable again, re-reading: %@", vBack.joined(separator: ", "))
+					let vFresh = walk(inPaths: vBack, inExclusions: inExclusions)
+					let vGuard = RootGuard.current(inRoots: inRoots, inProtected: inProtected)
+					inState.lock.lock()
+					logKept(inRoots: inState.index.replaceSubtrees(inRoots: vBack, inRecords: vFresh, inGuard: vGuard))
+					inState.dirty = true
+					inState.lock.unlock()
+				}
+			}
+		}
 	}
 
 	// walks the given subtrees, returning every indexable entry below them

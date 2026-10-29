@@ -27,6 +27,7 @@ struct SearchField: NSViewRepresentable {
 	func makeNSView(context inContext: Context) -> NSSearchField {
 		let vField = NSSearchField()
 		vField.placeholderString = placeholder
+		vField.toolTip = "Type to search as you type. ↓ moves to the results, ↑ recalls recent searches. The ? button lists the syntax."
 		vField.delegate = inContext.coordinator
 		vField.target = inContext.coordinator
 		vField.action = #selector(Coordinator.actionTriggered(_:))

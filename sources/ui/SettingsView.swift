@@ -53,6 +53,7 @@ private struct GeneralTab: View {
 				// control starts on the same vertical line
 				LabeledContent("Menu bar:") {
 					Toggle("Show Allofit in the menu bar", isOn: $prefs.showMenuBarIcon)
+						.help("Adds an Allofit icon to the menu bar, with Show Allofit, Settings… and Quit.")
 				}
 				Picker("Global shortcut:", selection: $prefs.globalHotKey) {
 					ForEach(HotKeyPreset.allCases) { vPreset in
@@ -60,6 +61,7 @@ private struct GeneralTab: View {
 					}
 				}
 				.frame(maxWidth: 260)
+				.help("Press this shortcut in any app to show or hide Allofit.")
 				if !hotKey.isAvailable {
 					Text("This shortcut is already used by another app. Pick another one.")
 						.font(.caption)
@@ -67,6 +69,7 @@ private struct GeneralTab: View {
 				}
 				LabeledContent("Login:") {
 					Toggle("Start Allofit at login", isOn: loginBinding)
+						.help("Opens Allofit in the background when you log in, so the index stays up to date and the shortcut works right away.")
 				}
 				if loginStatus == .requiresApproval {
 					HStack {
@@ -75,6 +78,7 @@ private struct GeneralTab: View {
 							.foregroundColor(.orange)
 						Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
 							.controlSize(.small)
+							.help("Opens System Settings > General > Login Items, where Allofit must be allowed.")
 					}
 				}
 				if let vError = loginError {
@@ -94,8 +98,10 @@ private struct GeneralTab: View {
 					Text("Reveals it in Finder").tag(Preferences.PrimaryAction.reveal)
 				}
 				.frame(maxWidth: 360)
+				.help("What a double-click or Return does on a result. ⌘Return always reveals it in Finder.")
 				LabeledContent("Highlighting:") {
 					Toggle("Highlight matches in names and paths", isOn: $prefs.highlightMatches)
+						.help("Shows in bold the parts of names that match the search, and the matching folders in paths for search terms with a /.")
 				}
 			}
 
@@ -226,27 +232,39 @@ private struct RootsTab: View {
 			List(prefs.rootPaths, id: \.self, selection: $selection) { vPath in
 				HStack {
 					Text(vPath)
+						.lineLimit(1)
+						.truncationMode(.middle)
+						.help(vPath)
 					Spacer()
 					rootStatus(for: vPath)
+					Toggle("Protect", isOn: protection(for: vPath))
+						.toggleStyle(.checkbox)
+						.help("Never remove this whole folder, or almost all of it, from the index in one go. Use it for drives and shares that sometimes mount empty or late: such an update is refused and the entries stay searchable. Smaller changes apply as usual.")
 				}
 			}
 			.frame(minHeight: 200)
 
 			HStack {
 				Button("Add Folder…") { addFolder() }
+					.help("Choose folders to index. Everything inside them becomes searchable.")
 				Button("Remove") { removeSelected() }
 					.disabled(selection == nil)
+					.help("Stops indexing the selected folder and removes its entries from the index.")
 				Spacer()
 				Button("Reindex now") {
 					Task { await model.performReindex() }
 				}
 				.disabled(model.isWorking || model.isIndexing)
+				.help("Reads every folder again from scratch. Use it if results look wrong or out of date; the current results stay searchable meanwhile.")
 			}
 			if !model.workMessage.isEmpty {
 				Text(model.workMessage)
 					.font(.caption)
 					.foregroundColor(.secondary)
 			}
+			Text("A drive or share that isn't mounted keeps its entries until it's back, then it's read again. Protect also keeps them when it mounts empty or a read stops halfway.")
+				.font(.caption)
+				.foregroundColor(.secondary)
 			Text("In built-in mode, changes apply automatically: new folders are scanned and removed ones dropped from the index. With a service, they apply when the service restarts; Reindex now stops the daemon, deletes its cache, and restarts it so the fresh process re-scans from scratch.")
 				.font(.caption)
 				.foregroundColor(.secondary)
@@ -266,12 +284,28 @@ private struct RootsTab: View {
 					.font(.caption)
 					.foregroundColor(.secondary)
 			}
-		} else if !FileManager.default.fileExists(atPath: inPath) {
+		} else if !VolumeManager.isReachable(inPath: vCanonical) {
 			Text("Not available")
 				.font(.caption)
 				.foregroundColor(.orange)
-				.help("This folder can't be reached right now (an unmounted drive or network share?). Its entries stay searchable until it's removed.")
+				.help("This folder can't be reached right now (an unmounted drive or network share?). Its entries stay searchable and it's read again when it comes back.")
+		} else if let vKept = model.keptRoots[vCanonical] {
+			Text("Kept \(vKept.formatted(date: .omitted, time: .shortened))")
+				.font(.caption)
+				.foregroundColor(.orange)
+				.help("At \(vKept.formatted(date: .abbreviated, time: .shortened)), an update would have removed almost all of this folder from the index. It was refused and the entries were kept. If the folder really was emptied, turn Protect off.")
 		}
+	}
+
+	// binding to whether inPath is protected (Preferences.protectedRoots)
+	private func protection(for inPath: String) -> Binding<Bool> {
+		Binding(
+			get: { prefs.protectedRoots.contains(inPath) },
+			set: { vOn in
+				prefs.protectedRoots.removeAll { $0 == inPath }
+				if vOn { prefs.protectedRoots.append(inPath) }
+			}
+		)
 	}
 
 	// presents an Open panel to pick a folder, then appends it to rootPaths
@@ -291,6 +325,7 @@ private struct RootsTab: View {
 	private func removeSelected() {
 		guard let vSel = selection else { return }
 		prefs.rootPaths.removeAll { $0 == vSel }
+		prefs.protectedRoots.removeAll { $0 == vSel }
 		selection = nil
 	}
 }
@@ -318,27 +353,35 @@ private struct ExclusionsTab: View {
 			HStack {
 				TextField("Path, e.g. ~/Projects/build", text: $newExclusion)
 					.textFieldStyle(.roundedBorder)
-				Button("Add") {
-					let vTrim = newExclusion.trimmingCharacters(in: .whitespaces)
-					if !vTrim.isEmpty {
-						let vExpanded = (vTrim as NSString).expandingTildeInPath
-						if !prefs.excludedPaths.contains(vExpanded) {
-							prefs.excludedPaths.append(vExpanded)
-						}
-						newExclusion = ""
-					}
-				}
+					.onSubmit { addTyped() }
+					.help("A folder or file to skip, as a full path (~ for your home folder). Press Return or Add.")
+				Button("Add") { addTyped() }
+					.disabled(newExclusion.trimmingCharacters(in: .whitespaces).isEmpty)
+					.help("Excludes the typed path and everything inside it.")
 				Button("Choose Folder…") { chooseFolder() }
+					.help("Pick folders to exclude, along with everything inside them.")
 			}
 			HStack {
 				Button("Remove Selected") { removeSelected() }
 					.disabled(selection == nil)
+					.help("Indexes the selected path again.")
 				Spacer()
 			}
 			Text("Entries match exact paths and any descendants. In built-in mode, matching entries are removed from the index right away.")
 				.font(.caption)
 				.foregroundColor(.secondary)
 		}
+	}
+
+	// adds the typed path (~ expanded) as an exclusion
+	private func addTyped() {
+		let vTrim = newExclusion.trimmingCharacters(in: .whitespaces)
+		guard !vTrim.isEmpty else { return }
+		let vExpanded = (vTrim as NSString).expandingTildeInPath
+		if !prefs.excludedPaths.contains(vExpanded) {
+			prefs.excludedPaths.append(vExpanded)
+		}
+		newExclusion = ""
 	}
 
 	// presents an Open panel and adds the picked folders as exclusions
@@ -379,8 +422,10 @@ private struct VolumesTab: View {
 
 			Toggle("Include external local volumes (USB, Thunderbolt, etc.)",
 				   isOn: $prefs.includeMountedVolumes)
+				.help("Indexes every connected external drive (USB, Thunderbolt, SD card) without adding each one in Folders.")
 			Toggle("Include network volumes (SMB, AFP, NFS)",
 				   isOn: $prefs.includeNetworkVolumes)
+				.help("Indexes every mounted network share. Shares can be big and slow to read: to index just one, add it in Folders instead, where it can also be protected.")
 
 			Divider()
 
@@ -409,6 +454,7 @@ private struct VolumesTab: View {
 			}
 
 			Button("Refresh") { detected = VolumeManager.mountedVolumes() }
+				.help("Lists the mounted volumes again.")
 			Spacer()
 		}
 		.onAppear { detected = VolumeManager.mountedVolumes() }
@@ -446,8 +492,11 @@ private struct PerformanceTab: View {
 				.fixedSize(horizontal: false, vertical: true)
 			Form {
 				secondsPicker("While Allofit is focused", inChoices: kForegroundDelays, inValue: $prefs.updateDelayForeground)
+					.help("While you use Allofit. Shorter shows new and changed files sooner.")
 				secondsPicker("While another app is focused", inChoices: kBackgroundDelays, inValue: $prefs.updateDelayBackground)
+					.help("While an Allofit window is open behind another app.")
 				secondsPicker("With no window visible", inChoices: kHiddenDelays, inValue: $prefs.updateDelayHidden)
+					.help("While Allofit runs with no window shown. Showing a window applies the pending changes at once.")
 			}
 
 			Divider()
@@ -460,7 +509,9 @@ private struct PerformanceTab: View {
 				.fixedSize(horizontal: false, vertical: true)
 			Form {
 				secondsPicker("While Allofit is focused", inChoices: kForegroundRefreshes, inValue: $prefs.refreshIntervalForeground)
+					.help("Shorter keeps the list more current; longer keeps rows from moving while you read.")
 				secondsPicker("While another app is focused", inChoices: kBackgroundRefreshes, inValue: $prefs.refreshIntervalBackground)
+					.help("How often an open window behind another app refreshes its results.")
 			}
 
 			Divider()
@@ -472,6 +523,7 @@ private struct PerformanceTab: View {
 			HStack {
 				Spacer()
 				Button("Restore Defaults") { prefs.resetTimings() }
+					.help("Index updates: 2 s focused, 15 s behind another app, 1 min with no window. Result refresh: 1 s focused, 5 s behind another app.")
 			}
 			Spacer()
 		}
@@ -561,6 +613,7 @@ private struct ServiceTab: View {
 				Text("System service (LaunchDaemon as root, scans everything)").tag(Preferences.ServiceMode.rootDaemon)
 			}
 			.pickerStyle(.radioGroup)
+			.help("Who keeps the index up to date. A service keeps indexing while Allofit is closed, and the app only reads its index. Choose a mode, then Install.")
 
 			if prefs.serviceMode != .none && model.activeServiceMode == .none {
 				Text("The saved service isn't installed, so Allofit is indexing on its own. Install it again or choose Off.")
@@ -660,18 +713,22 @@ private struct ServiceTab: View {
 				}
 			}
 			.disabled(chosenMode == .none || model.isWorking)
+			.help("Installs and starts the chosen service. Also use it after updating Allofit, so the service runs the new version.")
 			Button("Uninstall…") { confirmUninstall = true }
 				.disabled(chosenMode == .none || !vInstalled || model.isWorking)
+				.help("Stops and removes the service. Allofit then indexes on its own while it's open.")
 			Button("Stop") {
 				let vMode = chosenMode
 				Task { await model.performStopService(inMode: vMode) }
 			}
 			.disabled(!vInstalled || !vRunning || model.isWorking)
+			.help("Stops the service until you start it again or restart the Mac. The index isn't updated meanwhile.")
 			Button("Start") {
 				let vMode = chosenMode
 				Task { await model.performStartService(inMode: vMode) }
 			}
 			.disabled(!vInstalled || vRunning || model.isWorking)
+			.help("Starts the installed service again.")
 			Spacer()
 		}
 		.confirmationDialog("Uninstall the background service?", isPresented: $confirmUninstall) {
@@ -716,6 +773,7 @@ private struct ServiceTab: View {
 					.font(.callout)
 					.monospacedDigit()
 			}
+			.help("The version of the copy the service runs. It doesn't update with the app: Install again after an update.")
 			LabeledContent("This app's version") {
 				HStack(spacing: 6) {
 					Text(vBundleVer)
@@ -734,6 +792,7 @@ private struct ServiceTab: View {
 						.font(.caption)
 						.foregroundColor(.secondary)
 				}
+				.help("The other kind of service (user or system). Only one should be installed.")
 			}
 		}
 	}
@@ -764,6 +823,9 @@ private struct ServiceTab: View {
 // shortcuts to reveal the file in Finder or wipe it (forcing a reindex).
 private struct CacheTab: View {
 
+	// explanation of the indexer / reader roles, shared with DiagnosticsTab
+	static let kRoleHelp = "Indexer: this app keeps the index up to date and saves it. Reader: a background service keeps it, and this app reloads it whenever the service saves."
+
 	@EnvironmentObject var prefs: Preferences
 	@EnvironmentObject var model: AppModel
 	// confirmation for Clear Cache
@@ -780,6 +842,7 @@ private struct CacheTab: View {
 						.textSelection(.enabled)
 						.font(.system(.callout, design: .monospaced))
 				}
+				.help("The saved index: the name, size and dates of every indexed item. It lets Allofit start without reading every folder again.")
 				LabeledContent("File exists") {
 					Text(cacheFileExists() ? "yes" : "no")
 						.font(.callout)
@@ -805,6 +868,7 @@ private struct CacheTab: View {
 						.font(.callout)
 						.foregroundColor(.secondary)
 				}
+				.help(Self.kRoleHelp)
 			}
 
 			Divider()
@@ -813,14 +877,16 @@ private struct CacheTab: View {
 				Button("Reveal in Finder") {
 					NSWorkspace.shared.activateFileViewerSelecting([currentCacheURL()])
 				}
+				.help("Shows the cache file in Finder.")
 				Button("Open Folder") {
 					NSWorkspace.shared.open(currentCacheURL().deletingLastPathComponent())
 				}
+				.help("Opens the folder holding the cache file.")
 				Button("Reload from disk") {
 					model.forceReloadCache()
 				}
 				.disabled(model.isIndexer)
-				.help("Manually re-read the cache file. Useful for verifying the daemon is updating it.")
+				.help("Reads the cache file the service wrote again. Only available when a service keeps the index.")
 				Spacer()
 				if model.isWorking {
 					ProgressView().controlSize(.small)
@@ -829,6 +895,7 @@ private struct CacheTab: View {
 					confirmClear = true
 				}
 				.disabled(model.isWorking)
+				.help("Deletes the saved index and rebuilds it from scratch.")
 				.confirmationDialog("Clear the index cache?", isPresented: $confirmClear) {
 					Button("Clear and Rebuild", role: .destructive) {
 						Task { await model.performClearCache() }
@@ -905,6 +972,7 @@ private struct DiagnosticsTab: View {
 					Text(model.isIndexer ? "indexer" : "reader")
 						.font(.callout)
 				}
+				.help(CacheTab.kRoleHelp)
 				LabeledContent("Cache path (GUI)") {
 					Text(IndexStore.cacheURL(forServiceMode: prefs.serviceMode).path)
 						.font(.system(.caption, design: .monospaced))
@@ -925,6 +993,7 @@ private struct DiagnosticsTab: View {
 						.font(.callout)
 						.foregroundColor(daemonStatus.hasPrefix("running") ? .primary : .red)
 				}
+				.help("The process currently keeping the index. Only one can at a time.")
 				LabeledContent("Service plist") {
 					Text(servicePlistStatus())
 						.font(.callout)
@@ -947,6 +1016,7 @@ private struct DiagnosticsTab: View {
 
 			HStack {
 				Button("Refresh now") { refresh() }
+					.help("Reads the status and the log again.")
 				Button("Open log") {
 					// revealed rather than opened: Finder never runs it
 					if let vPath = DiagnosticsTab.logPath(inMode: prefs.serviceMode) {
@@ -954,6 +1024,7 @@ private struct DiagnosticsTab: View {
 					}
 				}
 				.disabled(DiagnosticsTab.logPath(inMode: prefs.serviceMode) == nil)
+				.help("Shows the service's log file in Finder.")
 				Spacer()
 				Text("auto-refresh every 2s")
 					.font(.caption)
@@ -1074,17 +1145,20 @@ private struct DiagnosticsTab: View {
 							NSWorkspace.shared.open(vUrl)
 						}
 					}
+					.help("Opens System Settings > Privacy & Security > Full Disk Access.")
 					Button("Copy path") {
 						if let vPath = daemonBinaryPath() {
 							NSPasteboard.general.clearContents()
 							NSPasteboard.general.setString(vPath, forType: .string)
 						}
 					}
+					.help("Copies the binary's path. In the + file dialog of Full Disk Access, press ⇧⌘G and paste it.")
 					Button("Reveal binary") {
 						if let vPath = daemonBinaryPath() {
 							NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: vPath)])
 						}
 					}
+					.help("Shows the binary in Finder: drag it into the Full Disk Access list.")
 				}
 				.controlSize(.small)
 			}

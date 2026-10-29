@@ -1,4 +1,5 @@
 import Foundation
+import CoreServices
 import Testing
 @testable import Allofit
 
@@ -247,5 +248,82 @@ struct IndexStateTests {
 		let vLoaded = try #require(IndexStore.load(from: vUrl))
 		#expect(vLoaded.lastEventId == 42)
 		#expect(vLoaded.records == vRecords)
+	}
+
+	// ===========================
+	// MARK: Root guard
+	// ===========================
+
+	// a root /p holding a folder of inCount files, plus another root /r
+	static func bigState(inCount: Int) -> IndexState {
+		var vRecords = [dir("/p"), dir("/p/big"), file("/p/keep.txt")]
+		for vI in 0..<inCount { vRecords.append(file("/p/big/f\(vI)")) }
+		return IndexState(inRecords: vRecords + sampleState().records)
+	}
+
+	@Test func changesBelowAnOfflineRootAreIgnored() {
+		// an unmounted share reports its root as gone
+		let vChanges = [
+			FSChange(path: "/p", flags: 0, eventId: 5),
+			FSChange(path: "/p/big", flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs), eventId: 6),
+			FSChange(path: "/p", flags: FSEventStreamEventFlags(kFSEventStreamEventFlagUnmount), eventId: 7)
+		]
+		let vResolved = IndexState.resolve(inChanges: vChanges,
+										   inExclusions: ExclusionMatcher(inExclusions: []),
+										   inGuard: RootGuard(inOffline: ["/p"]))
+		#expect(vResolved.removals.isEmpty)
+		#expect(vResolved.rescans.isEmpty)
+		#expect(vResolved.maxEventId == 7)
+	}
+
+	@Test func rescanOfAnOfflineRootKeepsItsEntries() {
+		var vState = Self.bigState(inCount: 10)
+		let vBefore = vState.count
+		vState.replaceSubtrees(inRoots: ["/p", "/r/a"], inRecords: [Self.dir("/r/a")], inGuard: RootGuard(inOffline: ["/p"]))
+		// /p untouched, /r/a replaced
+		#expect(vState.count == vBefore - 3)
+		#expect(vState.contains(inPath: "/p/big/f9"))
+		#expect(!vState.contains(inPath: "/r/a/1.txt"))
+	}
+
+	@Test func protectedRootRefusesAWipe() {
+		var vState = Self.bigState(inCount: 200)
+		let vBefore = vState.count
+		let vGuard = RootGuard(inProtected: ["/p"])
+		// the root itself
+		var vChanges = ResolvedChanges()
+		vChanges.removals = ["/p"]
+		#expect(vState.apply(inChanges: vChanges, inRoots: ["/p", "/r"], inGuard: vGuard).spared == ["/p"])
+		// almost all of it
+		vChanges.removals = ["/p/big"]
+		#expect(vState.apply(inChanges: vChanges, inRoots: ["/p", "/r"], inGuard: vGuard).spared == ["/p"])
+		// a rescan finding nothing
+		#expect(vState.replaceSubtrees(inRoots: ["/p"], inRecords: [Self.dir("/p")], inGuard: vGuard) == ["/p"])
+		#expect(vState.count == vBefore)
+		// unprotected roots change as usual
+		vChanges.removals = ["/r/a"]
+		#expect(vState.apply(inChanges: vChanges, inRoots: ["/p", "/r"], inGuard: vGuard).changed)
+		#expect(!vState.contains(inPath: "/r/a/b/2.txt"))
+	}
+
+	@Test func protectedRootAcceptsPartialChanges() {
+		var vState = Self.bigState(inCount: 200)
+		let vGuard = RootGuard(inProtected: ["/p"])
+		var vChanges = ResolvedChanges()
+		vChanges.removals = (0..<150).map { "/p/big/f\($0)" }
+		let vResult = vState.apply(inChanges: vChanges, inRoots: ["/p"], inGuard: vGuard)
+		#expect(vResult.spared.isEmpty)
+		#expect(vState.count(inRoot: "/p") == 53)
+		// a small protected root can empty
+		var vSmall = Self.bigState(inCount: 5)
+		vChanges.removals = ["/p/big"]
+		#expect(vSmall.apply(inChanges: vChanges, inRoots: ["/p"], inGuard: vGuard).spared.isEmpty)
+		#expect(vSmall.count(inRoot: "/p") == 2)
+	}
+
+	@Test func reachabilityNeedsAMountedVolume() {
+		#expect(VolumeManager.isReachable(inPath: "/Users"))
+		#expect(!VolumeManager.isReachable(inPath: "/no/such/root"))
+		#expect(!VolumeManager.isReachable(inPath: "/Volumes/NoSuchShare-Allofit"))
 	}
 }

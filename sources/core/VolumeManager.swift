@@ -68,6 +68,26 @@ enum VolumeManager {
 			.map { URL(fileURLWithPath: $0) }
 	}
 
+	// true when inPath is a folder that can be read right now. Below
+	// /Volumes/<name>, that volume must also be mounted: an unmounted share
+	// can leave an empty folder with its name behind, which would look like
+	// a share whose files were all deleted.
+	static func isReachable(inPath: String) -> Bool {
+		var vIsDir: ObjCBool = false
+		guard FileManager.default.fileExists(atPath: inPath, isDirectory: &vIsDir), vIsDir.boolValue else {
+			return false
+		}
+		let vParts = inPath.split(separator: "/", omittingEmptySubsequences: true)
+		guard vParts.count >= 2, vParts[0] == "Volumes" else { return true }
+		let vMountPoint = "/Volumes/" + vParts[1]
+		var vStat = statfs()
+		guard statfs(inPath, &vStat) == 0 else { return false }
+		let vMountedOn = withUnsafeBytes(of: &vStat.f_mntonname) { vBytes in
+			String(decoding: vBytes.prefix { $0 != 0 }, as: UTF8.self)
+		}
+		return RootGuard.isAtOrBelow(inPath: vMountedOn, inRoot: vMountPoint)
+	}
+
 	// the path the kernel reports for inPath (symlinks resolved, e.g.
 	// /tmp -> /private/tmp), which is what FSEvents and the walker produce.
 	// Foundation's standardizedFileURL / resolvingSymlinksInPath strip the

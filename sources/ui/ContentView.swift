@@ -50,7 +50,7 @@ struct ContentView: View {
 						  systemImage: showPreviewPane ? "sidebar.right" : "sidebar.squares.right")
 						.labelStyle(.iconOnly)
 				}
-				.help(showPreviewPane ? "Hide preview" : "Show preview")
+				.help(showPreviewPane ? "Hide the preview of the selected file" : "Show a preview of the selected file")
 			}
 			ToolbarItem(placement: .primaryAction) {
 				SettingsLink {
@@ -95,7 +95,7 @@ struct ContentView: View {
 			.labelsHidden()
 			.pickerStyle(.menu)
 			.fixedSize()
-			.help("Show only one kind of item")
+			.help("Show only one kind of item (folders, documents, pictures…), combined with the search")
 			// search syntax cheat sheet
 			Button {
 				showSyntaxHelp.toggle()
@@ -104,7 +104,7 @@ struct ContentView: View {
 					.labelStyle(.iconOnly)
 			}
 			.buttonStyle(.borderless)
-			.help("Search syntax")
+			.help("Search syntax: wildcards, AND / OR / NOT, ext:, folder:, paths…")
 			.popover(isPresented: $showSyntaxHelp, arrowEdge: .bottom) {
 				SyntaxHelpView()
 			}
@@ -302,7 +302,7 @@ private struct StatusBarView: View {
 					ProgressView()
 						.controlSize(.small)
 					Text(scanText)
-						.help(model.scans.map { $0.path }.joined(separator: "\n"))
+						.help("Reading these folders; their files appear as they're found:\n" + model.scans.map { $0.path }.joined(separator: "\n"))
 				}
 			}
 			Spacer()

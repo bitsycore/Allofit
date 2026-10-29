@@ -93,6 +93,13 @@ struct IndexState {
 	// Returns the number of records removed.
 	@discardableResult
 	mutating func removeSubtrees(inPaths: [String]) -> Int {
+		let vPositions = subtreePositions(inPaths: inPaths)
+		remove(inPositions: Array(vPositions))
+		return vPositions.count
+	}
+
+	// positions of the records removeSubtrees(inPaths:) would remove
+	private func subtreePositions(inPaths: [String]) -> Set<Int> {
 		var vPositions = Set<Int>()
 		var vDirPrefixes: [String] = []
 		for vPath in inPaths {
@@ -108,14 +115,57 @@ struct IndexState {
 				vPositions.insert(vPos)
 			}
 		}
-		remove(inPositions: Array(vPositions))
-		return vPositions.count
+		return vPositions
+	}
+
+	// number of records at or below inRoot, and at or below one of
+	// inWithin's folders when given
+	func count(inRoot: String, inWithin: SubtreeMatcher? = nil) -> Int {
+		let vRoot = SubtreeMatcher(inRoots: [inRoot])
+		var vCount = 0
+		for vRecord in records where vRoot.covers(inRecord: vRecord) {
+			if let vWithin = inWithin, !vWithin.covers(inRecord: vRecord) { continue }
+			vCount += 1
+		}
+		return vCount
 	}
 
 	// replaces everything at and below each root with the given records
-	// (the result of re-walking those subtrees)
-	mutating func replaceSubtrees(inRoots: [String], inRecords: [FileRecord]) {
-		let vMatcher = SubtreeMatcher(inRoots: inRoots)
+	// (the result of re-walking those subtrees). Subtrees of an offline
+	// root of inGuard are left as they are, as are those of a protected
+	// root the new records would wipe. Returns the roots spared that way.
+	@discardableResult
+	mutating func replaceSubtrees(inRoots: [String],
+								  inRecords: [FileRecord],
+								  inGuard: RootGuard = RootGuard()) -> [String] {
+		var vRoots = inRoots
+		var vRecords = inRecords
+		var vSpared: [String] = []
+		if !inGuard.isEmpty {
+			// a walked folder of an offline root found nothing real
+			vRoots.removeAll { inGuard.isOffline(inPath: $0) }
+			for vProtected in inGuard.protected {
+				let vTouching = vRoots.filter {
+					RootGuard.isAtOrBelow(inPath: $0, inRoot: vProtected) || RootGuard.isAtOrBelow(inPath: vProtected, inRoot: $0)
+				}
+				guard !vTouching.isEmpty else { continue }
+				let vReplaced = SubtreeMatcher(inRoots: vTouching)
+				let vRootMatcher = SubtreeMatcher(inRoots: [vProtected])
+				let vBefore = count(inRoot: vProtected)
+				let vRemoved = count(inRoot: vProtected, inWithin: vReplaced)
+				let vAdded = vRecords.filter { vRootMatcher.covers(inRecord: $0) && vReplaced.covers(inRecord: $0) }.count
+				if RootGuard.isWipe(inBefore: vBefore, inAfter: vBefore - vRemoved + vAdded) {
+					vSpared.append(vProtected)
+					vRoots.removeAll { vTouching.contains($0) }
+				}
+			}
+			if vRoots.count != inRoots.count {
+				let vKept = SubtreeMatcher(inRoots: vRoots)
+				vRecords.removeAll { !vKept.covers(inRecord: $0) }
+			}
+		}
+		guard !vRoots.isEmpty else { return vSpared }
+		let vMatcher = SubtreeMatcher(inRoots: vRoots)
 		var vPositions: [Int] = []
 		for (vPos, vRecord) in records.enumerated() {
 			if vMatcher.containsChild(inParentPath: vRecord.parentPath) || vMatcher.isRoot(inRecord: vRecord) {
@@ -123,24 +173,29 @@ struct IndexState {
 			}
 		}
 		remove(inPositions: vPositions)
-		for vRecord in inRecords {
+		for vRecord in vRecords {
 			upsert(vRecord)
 		}
+		return vSpared
 	}
 
-	// merges resolved FSEvents changes. Returns whether anything changed and
-	// the subtrees that must be (re)walked: kernel-requested rescans plus
-	// directories that newly appeared. inRoots are the configured roots,
-	// whose own records are allowed without an indexed parent.
+	// merges resolved FSEvents changes. Returns whether anything changed,
+	// the subtrees that must be (re)walked (kernel-requested rescans plus
+	// directories that newly appeared) and the protected roots of inGuard
+	// whose wipe was refused. inRoots are the configured roots, whose own
+	// records are allowed without an indexed parent.
 	mutating func apply(inChanges: ResolvedChanges,
-						inRoots: Set<String>) -> (changed: Bool, rescans: [String], newFolders: [String]) {
+						inRoots: Set<String>,
+						inGuard: RootGuard = RootGuard())
+		-> (changed: Bool, rescans: [String], newFolders: [String], spared: [String]) {
 		var vChanged = false
 		var vRescans: [String] = []
 		var vNewFolders: [String] = []
 
 		// removals first: a rename shows up as old path gone + new path present
-		if !inChanges.removals.isEmpty {
-			vChanged = removeSubtrees(inPaths: inChanges.removals) > 0 || vChanged
+		let (vRemovals, vSpared) = guardRemovals(inPaths: inChanges.removals, inGuard: inGuard)
+		if !vRemovals.isEmpty {
+			vChanged = removeSubtrees(inPaths: vRemovals) > 0 || vChanged
 		}
 
 		// parents before children, so a new folder and its new files arriving
@@ -171,7 +226,39 @@ struct IndexState {
 		let vFolders = SubtreeMatcher.minimalRoots(inPaths: vNewFolders).filter { vFolder in
 			!vMinimalRescans.contains(vFolder) && !vCovered.containsChild(inParentPath: (vFolder as NSString).deletingLastPathComponent)
 		}
-		return (vChanged, vMinimalRescans, vFolders)
+		return (vChanged, vMinimalRescans, vFolders, vSpared)
+	}
+
+	// drops the removals that would wipe a protected root of inGuard: the
+	// root itself (or a folder above it), or a batch taking more than
+	// RootGuard.kMaxRemovedShare of its entries. Returns the removals to
+	// apply and the roots spared.
+	private func guardRemovals(inPaths: [String], inGuard: RootGuard) -> (kept: [String], spared: [String]) {
+		guard !inGuard.protected.isEmpty, !inPaths.isEmpty else { return (inPaths, []) }
+		var vKept: [String] = []
+		var vByRoot: [String: [String]] = [:]
+		var vSpared = Set<String>()
+		for vPath in inPaths {
+			if let vRoot = inGuard.protectedRootRemoved(by: vPath) {
+				if contains(inPath: vRoot) { vSpared.insert(vRoot) }
+			} else if let vRoot = inGuard.protectedRoot(of: vPath) {
+				vByRoot[vRoot, default: []].append(vPath)
+			} else {
+				vKept.append(vPath)
+			}
+		}
+		for (vRoot, vPaths) in vByRoot {
+			let vRemoved = subtreePositions(inPaths: vPaths).count
+			if vRemoved >= RootGuard.kMinimumWipe {
+				let vBefore = count(inRoot: vRoot)
+				if RootGuard.isWipe(inBefore: vBefore, inAfter: vBefore - vRemoved) {
+					vSpared.insert(vRoot)
+					continue
+				}
+			}
+			vKept.append(contentsOf: vPaths)
+		}
+		return (vKept, Array(vSpared))
 	}
 
 	// adds the records found by walking folders that just appeared. Nothing
@@ -245,8 +332,12 @@ struct IndexState {
 
 	// resolves raw FSEvents changes against the filesystem. Each unique path
 	// is stat'ed once however many times it was reported (a multi-day replay
-	// repeats hot files thousands of times). Safe to call on any thread.
-	static func resolve(inChanges: [FSChange], inExclusions: ExclusionMatcher) -> ResolvedChanges {
+	// repeats hot files thousands of times). Changes below an offline root of
+	// inGuard are dropped: its volume isn't mounted, so its files only look
+	// gone. Safe to call on any thread.
+	static func resolve(inChanges: [FSChange],
+						inExclusions: ExclusionMatcher,
+						inGuard: RootGuard = RootGuard()) -> ResolvedChanges {
 		var vResult = ResolvedChanges()
 		var vSeen = Set<String>()
 		var vRescanSeen = Set<String>()
@@ -255,6 +346,9 @@ struct IndexState {
 			vResult.maxEventId = max(vResult.maxEventId, UInt64(vChange.eventId))
 			if vChange.isHistoryDone {
 				vResult.historyDone = true
+				continue
+			}
+			if vChange.isVolumeEvent || inGuard.isOffline(inPath: vChange.path) {
 				continue
 			}
 			if vChange.mustScanSubDirs {
@@ -333,6 +427,11 @@ struct SubtreeMatcher {
 	// true if the record is one of the roots itself
 	func isRoot(inRecord: FileRecord) -> Bool {
 		return rootIds.contains(inRecord.id)
+	}
+
+	// true if the record is one of the roots or lies below one
+	func covers(inRecord: FileRecord) -> Bool {
+		return isRoot(inRecord: inRecord) || containsChild(inParentPath: inRecord.parentPath)
 	}
 
 	// removes duplicates and paths nested under another path of the list,

@@ -41,6 +41,8 @@ struct ResultsTable: NSViewRepresentable {
 	let perform: (ResultAction, [FileRecord]) -> Void
 
 	// column identifiers, also the autosave keys
+	// column header tooltip
+	static let kHeaderHelp = "Click to sort, click again to reverse. Drag to reorder. Right-click to show or hide columns."
 	static let kNameColumn = NSUserInterfaceItemIdentifier("name")
 	static let kPathColumn = NSUserInterfaceItemIdentifier("path")
 	static let kSizeColumn = NSUserInterfaceItemIdentifier("size")
@@ -73,6 +75,7 @@ struct ResultsTable: NSViewRepresentable {
 		] {
 			let vColumn = NSTableColumn(identifier: vId)
 			vColumn.title = vTitle
+			vColumn.headerToolTip = Self.kHeaderHelp
 			vColumn.width = vWidth
 			vColumn.minWidth = vMin
 			vColumn.sortDescriptorPrototype = NSSortDescriptor(key: vId.rawValue, ascending: true)

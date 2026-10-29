@@ -23,6 +23,10 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 	@Published var rootPaths: [String] {
 		didSet { UserDefaults.standard.set(rootPaths, forKey: Self.kRootPathsKey) }
 	}
+	// roots whose entries are never wiped at once (see RootGuard)
+	@Published var protectedRoots: [String] {
+		didSet { UserDefaults.standard.set(protectedRoots, forKey: Self.kProtectedRootsKey) }
+	}
 	// absolute paths to skip while indexing (descendants also skipped)
 	@Published var excludedPaths: [String] {
 		didSet { UserDefaults.standard.set(excludedPaths, forKey: Self.kExcludedPathsKey) }
@@ -115,6 +119,7 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 
 	private static let kRootPathsKey = "Allofit.rootPaths"
 	private static let kExcludedPathsKey = "Allofit.excludedPaths"
+	private static let kProtectedRootsKey = "Allofit.protectedRoots"
 	private static let kMountedKey = "Allofit.includeMountedVolumes"
 	private static let kNetworkKey = "Allofit.includeNetworkVolumes"
 	private static let kServiceModeKey = "Allofit.serviceMode"
@@ -146,6 +151,7 @@ final class Preferences: ObservableObject, @unchecked Sendable {
 			?? Self.defaultRootPaths()
 		excludedPaths = Self.readArray(forKey: Self.kExcludedPathsKey, from: vSourceDict)
 			?? Self.defaultExcludedPaths()
+		protectedRoots = Self.readArray(forKey: Self.kProtectedRootsKey, from: vSourceDict) ?? []
 		includeMountedVolumes = Self.readBool(forKey: Self.kMountedKey, from: vSourceDict) ?? false
 		includeNetworkVolumes = Self.readBool(forKey: Self.kNetworkKey, from: vSourceDict) ?? false
 		if let vRaw = Self.readString(forKey: Self.kServiceModeKey, from: vSourceDict),

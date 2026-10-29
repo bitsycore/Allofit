@@ -2,6 +2,20 @@
 
 All notable changes to Allofit are documented here.
 
+## [1.0.11] - 2026-10-29
+
+### Fixed
+
+- **A network share or drive that wasn't mounted lost all its entries.** When a root folder such as `/Volumes/MyShare` wasn't mounted yet (for example until you open it in Finder), macOS reported it as gone and Allofit dropped everything below it. Changes and rescans of a root that can't be reached are now ignored, so its entries stay searchable. When the volume mounts, the root is read again to pick up what changed meanwhile. A leftover empty folder in `/Volumes` doesn't count as mounted.
+
+### Added
+
+- **Protect** option for each folder in Settings → Indexes → Folders. A protected folder refuses any single update that would remove it, or more than 90% of its entries: for example a share that mounts empty, or a read cut off by a network error. Its entries stay searchable, and the folder shows "Kept" with the time. Smaller changes apply as usual, and folders with fewer than 100 entries aren't guarded. This works in built-in mode and with the background service.
+
+### Changed
+
+- **Tooltips** on the settings, buttons, search field and column headers explain what each one does. In Exclusions, Return in the path field adds the path.
+
 ## [1.0.10] - 2026-10-06
 
 ### Fixed
