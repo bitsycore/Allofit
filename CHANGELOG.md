@@ -2,6 +2,24 @@
 
 All notable changes to Allofit are documented here.
 
+## [1.0.12] - 2026-11-18
+
+### Fixed
+
+- **The window froze while another program created or deleted many files** (a test suite, a build). Removing thousands of folders at once compared each indexed entry with each removed folder, on the thread that runs the window, for seconds at a time. The check is now a binary search, about 1000× less work in that case, and every index update runs in the background: typing, scrolling and clicking stay responsive whatever the file activity.
+- **Slow startup with a large index:** the cleanup pass after loading took over half a minute for 2.7 million entries; it now takes about 2 s. Loading also runs at user priority, so a busy Mac no longer stretches it to over a minute.
+
+### Added
+
+- **Signed and notarized releases:** once the signing secrets are set up, releases are signed with a Developer ID and notarized by Apple, so they open without Gatekeeper warnings (see README → Signing).
+
+### Changed
+
+- **Background service:** it now runs a copy of a helper signed on its own, `Contents/Helpers/Allofit Service`, instead of a copy of the app's program, whose signature didn't hold outside the app. With signed releases, the Full Disk Access granted to the system service persists across updates. Reinstall the service once after updating.
+- **Less background work during heavy file activity:**
+  - The index is saved less often when a save is expensive: at least 10× its own duration apart, instead of every 30 s.
+  - When macOS asks Allofit several times to re-read the same folder, one re-read covers all the requests, instead of reading the folder once per request.
+
 ## [1.0.11] - 2026-10-29
 
 ### Fixed

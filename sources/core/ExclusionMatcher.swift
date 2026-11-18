@@ -25,7 +25,12 @@ struct ExclusionMatcher: Sendable {
 			return vStandard
 		}
 		prefixes = paths.map { Array(($0 == "/" ? "/" : $0 + "/").utf8) }
+		pathIds = Set(paths.map { FileRecord.pathHash($0) })
 	}
+
+	// record ids (path hashes) of the exclusions themselves: a record whose
+	// id is in here is an exclusion, without building its full path
+	let pathIds: Set<UInt64>
 
 	// returns true when inPath matches an exclusion exactly or is below one
 	func isExcluded(inPath: String) -> Bool {

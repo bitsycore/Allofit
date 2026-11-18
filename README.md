@@ -8,7 +8,7 @@ Keeps an in-memory index of file names + metadata, updates in real time via FSEv
 
 Grab the latest `.dmg` from [Releases](https://github.com/bitsycore/Allofit/releases). Open it, drag `Allofit` onto `Applications`.
 
-First launch will be blocked by Gatekeeper (ad-hoc signed). Right-click → **Open**, or:
+Releases signed with a Developer ID and notarized by Apple open directly. Older releases are only ad-hoc signed, so Gatekeeper blocks their first launch: right-click → **Open**, or:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Allofit.app
@@ -71,6 +71,22 @@ Root daemon mode needs **Full Disk Access** granted to its binary in **System Se
 (The version is stamped into both the filename and the bundle's Info.plist. Pass `--version 1.2.3` or set `ALLOFIT_VERSION=1.2.3` to override.)
 
 `./scripts/clean.sh` wipes services, caches, prefs, and build artifacts (including `outputs/`) for a fresh start.
+
+Local builds are ad-hoc signed. To sign with a certificate from your keychain, set `ALLOFIT_SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"`. `scripts/notarize.sh` then notarizes and staples the `.app` or `.dmg`, given an App Store Connect API key in `NOTARY_KEY_PATH`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID`.
+
+## Signing
+
+The release workflow signs and notarizes when these repository secrets exist, and publishes ad-hoc builds otherwise:
+
+| Secret | Content |
+|---|---|
+| `DEVELOPER_ID_P12` | the Developer ID Application certificate and its key, exported as `.p12`, base64-encoded (`base64 -i cert.p12`) |
+| `DEVELOPER_ID_P12_PASSWORD` | the `.p12` export password |
+| `NOTARY_KEY_P8` | an App Store Connect API key (Users and Access → Integrations → Team Keys, Developer role): the `.p8` file's content |
+| `NOTARY_KEY_ID` | that key's ID |
+| `NOTARY_ISSUER_ID` | the issuer ID shown above the key list |
+
+The background service runs a copy of `Contents/Helpers/Allofit Service`, signed on its own, so its signature, and the Full Disk Access granted to it, survive updates.
 
 ## License
 

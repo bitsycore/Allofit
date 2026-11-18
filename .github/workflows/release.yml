@@ -15,6 +15,10 @@ jobs:
   release:
     name: Build .app + DMG and publish release
     runs-on: macos-15
+    env:
+      # signed and notarized releases once the five secrets exist
+      # (see README > Signing), unsigned ad-hoc builds before that
+      SIGNING_ENABLED: ${{ secrets.DEVELOPER_ID_P12 != '' && secrets.NOTARY_KEY_P8 != '' }}
 
     steps:
       - name: Checkout
@@ -35,11 +39,51 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Building Allofit ${version} from tag ${tag}"
 
+      # a throwaway keychain holding the Developer ID certificate; its
+      # identity name goes to ALLOFIT_SIGN_IDENTITY for the build scripts
+      - name: Import signing certificate
+        if: env.SIGNING_ENABLED == 'true'
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          vKeychain="${RUNNER_TEMP}/signing.keychain-db"
+          vKeychainPassword="$(openssl rand -base64 24)"
+          printf '%s' "${DEVELOPER_ID_P12}" | base64 --decode > "${RUNNER_TEMP}/developer-id.p12"
+          security create-keychain -p "${vKeychainPassword}" "${vKeychain}"
+          security set-keychain-settings -lut 21600 "${vKeychain}"
+          security unlock-keychain -p "${vKeychainPassword}" "${vKeychain}"
+          security import "${RUNNER_TEMP}/developer-id.p12" -k "${vKeychain}" \
+            -P "${DEVELOPER_ID_P12_PASSWORD}" -T /usr/bin/codesign
+          rm -f "${RUNNER_TEMP}/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "${vKeychainPassword}" "${vKeychain}" > /dev/null
+          security list-keychains -d user -s "${vKeychain}" \
+            $(security list-keychains -d user | tr -d '"')
+          vIdentity="$(security find-identity -v -p codesigning "${vKeychain}" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "${vIdentity}" ]; then
+            echo "::error::No Developer ID Application identity in DEVELOPER_ID_P12"
+            exit 1
+          fi
+          echo "Signing as ${vIdentity}"
+          echo "ALLOFIT_SIGN_IDENTITY=${vIdentity}" >> "${GITHUB_ENV}"
+          printf '%s' "${NOTARY_KEY_P8}" > "${RUNNER_TEMP}/notary-key.p8"
+          echo "NOTARY_KEY_PATH=${RUNNER_TEMP}/notary-key.p8" >> "${GITHUB_ENV}"
+
       - name: Build Allofit.app
         env:
           ALLOFIT_VERSION: ${{ steps.version.outputs.version }}
           ALLOFIT_BUILD: ${{ github.run_number }}
         run: ./scripts/build-app.sh
+
+      - name: Notarize Allofit.app
+        if: env.SIGNING_ENABLED == 'true'
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: ./scripts/notarize.sh "outputs/Allofit-${{ steps.version.outputs.version }}.app"
 
       - name: Zip Allofit.app (ditto preserves bundle metadata + signatures)
         working-directory: outputs
@@ -52,6 +96,13 @@ jobs:
         env:
           ALLOFIT_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-dmg.sh --skip-build
+
+      - name: Notarize DMG
+        if: env.SIGNING_ENABLED == 'true'
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: ./scripts/notarize.sh "outputs/Allofit-${{ steps.version.outputs.version }}.dmg"
 
       - name: SHA-256 checksums
         working-directory: outputs
@@ -73,3 +124,10 @@ jobs:
             outputs/Allofit-${{ steps.version.outputs.version }}.zip
             outputs/Allofit-${{ steps.version.outputs.version }}.dmg
             outputs/Allofit-${{ steps.version.outputs.version }}.sha256
+
+      # the runner may be reused: never leave the key behind
+      - name: Remove signing keychain and notary key
+        if: always()
+        run: |
+          security delete-keychain "${RUNNER_TEMP}/signing.keychain-db" 2> /dev/null || true
+          rm -f "${RUNNER_TEMP}/notary-key.p8" "${RUNNER_TEMP}/developer-id.p12"

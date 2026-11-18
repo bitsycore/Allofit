@@ -110,10 +110,7 @@ struct IndexState {
 			}
 		}
 		if !vDirPrefixes.isEmpty {
-			let vMatcher = SubtreeMatcher(inRoots: vDirPrefixes)
-			for (vPos, vRecord) in records.enumerated() where vMatcher.containsChild(inParentPath: vRecord.parentPath) {
-				vPositions.insert(vPos)
-			}
+			vPositions.formUnion(records.positions(coveredBy: SubtreeMatcher(inRoots: vDirPrefixes)))
 		}
 		return vPositions
 	}
@@ -121,13 +118,9 @@ struct IndexState {
 	// number of records at or below inRoot, and at or below one of
 	// inWithin's folders when given
 	func count(inRoot: String, inWithin: SubtreeMatcher? = nil) -> Int {
-		let vRoot = SubtreeMatcher(inRoots: [inRoot])
-		var vCount = 0
-		for vRecord in records where vRoot.covers(inRecord: vRecord) {
-			if let vWithin = inWithin, !vWithin.covers(inRecord: vRecord) { continue }
-			vCount += 1
-		}
-		return vCount
+		let vPositions = records.positions(coveredBy: SubtreeMatcher(inRoots: [inRoot]))
+		guard let vWithin = inWithin else { return vPositions.count }
+		return vPositions.reduce(0) { $0 + (vWithin.covers(inRecord: records[$1]) ? 1 : 0) }
 	}
 
 	// replaces everything at and below each root with the given records
@@ -165,14 +158,7 @@ struct IndexState {
 			}
 		}
 		guard !vRoots.isEmpty else { return vSpared }
-		let vMatcher = SubtreeMatcher(inRoots: vRoots)
-		var vPositions: [Int] = []
-		for (vPos, vRecord) in records.enumerated() {
-			if vMatcher.containsChild(inParentPath: vRecord.parentPath) || vMatcher.isRoot(inRecord: vRecord) {
-				vPositions.append(vPos)
-			}
-		}
-		remove(inPositions: vPositions)
+		remove(inPositions: records.positions(coveredBy: SubtreeMatcher(inRoots: vRoots)))
 		for vRecord in vRecords {
 			upsert(vRecord)
 		}
@@ -283,27 +269,35 @@ struct IndexState {
 	mutating func prune(inRoots: Set<String>,
 						inExclusions: ExclusionMatcher,
 						inIsHidden: ((String) -> Bool)? = nil) -> Int {
-		// visit shallow entries first so a dropped directory takes its
-		// descendants with it in the same pass
-		let vOrder = records.indices.sorted {
-			records[$0].parentPath.utf8.count < records[$1].parentPath.utf8.count
-		}
+		// Thanks to the parent rule, a record below an exclusion is dropped
+		// with its excluded ancestor, so apart from roots only exact matches
+		// need checking, by id. Everything is compared by path hash: no full
+		// path is built except for the few folders directly under a root.
+		let vRootIds = Set(inRoots.map { FileRecord.pathHash($0) })
 		var vKept = Set<UInt64>()
 		vKept.reserveCapacity(records.count)
 		var vDrop: [Int] = []
-		for vPos in vOrder {
+		var vLastParent = ""
+		var vLastParentId: UInt64 = 0
+		for vPos in positionsByDepth() {
 			let vRecord = records[vPos]
-			let vFull = vRecord.fullPath
-			let vIsRoot = inRoots.contains(vFull)
-			var vKeep = vIsRoot || vKept.contains(FileRecord.pathHash(vRecord.parentPath))
-			if vKeep && !vIsRoot {
-				if vRecord.name.hasPrefix(".") {
-					vKeep = false
-				} else if vRecord.isDirectory, inRoots.contains(vRecord.parentPath), let vCheck = inIsHidden {
-					vKeep = !vCheck(vFull)
+			if vRecord.parentPath != vLastParent {
+				vLastParent = vRecord.parentPath
+				vLastParentId = FileRecord.pathHash(vLastParent)
+			}
+			var vKeep: Bool
+			if vRootIds.contains(vRecord.id) {
+				// a root under an exclusion (rare): full check
+				vKeep = !inExclusions.isExcluded(inPath: vRecord.fullPath)
+			} else {
+				vKeep = vKept.contains(vLastParentId)
+					&& !vRecord.name.hasPrefix(".")
+					&& !inExclusions.pathIds.contains(vRecord.id)
+				if vKeep, vRecord.isDirectory, vRootIds.contains(vLastParentId), let vCheck = inIsHidden {
+					vKeep = !vCheck(vRecord.fullPath)
 				}
 			}
-			if vKeep && !inExclusions.isExcluded(inPath: vFull) {
+			if vKeep {
 				vKept.insert(vRecord.id)
 			} else {
 				vDrop.append(vPos)
@@ -311,6 +305,37 @@ struct IndexState {
 		}
 		remove(inPositions: vDrop)
 		return vDrop.count
+	}
+
+	// every position, shallow entries first (by parent path length), so a
+	// parent is always visited before its children. A counting sort over
+	// the lengths: linear, and no record is copied to compare.
+	private func positionsByDepth() -> [Int] {
+		var vLengths = [Int](repeating: 0, count: records.count)
+		var vMaxLength = 0
+		for vChunkIndex in 0..<records.chunkCount {
+			let vBase = vChunkIndex << RecordStore.kShift
+			records.chunk(at: vChunkIndex).withUnsafeBufferPointer { vBuffer in
+				for vI in vBuffer.indices {
+					let vLength = vBuffer[vI].parentPath.utf8.count
+					vLengths[vBase + vI] = vLength
+					vMaxLength = max(vMaxLength, vLength)
+				}
+			}
+		}
+		var vStarts = [Int](repeating: 0, count: vMaxLength + 2)
+		for vLength in vLengths {
+			vStarts[vLength + 1] += 1
+		}
+		for vI in 1..<vStarts.count {
+			vStarts[vI] += vStarts[vI - 1]
+		}
+		var vOrder = [Int](repeating: 0, count: records.count)
+		for (vPos, vLength) in vLengths.enumerated() {
+			vOrder[vStarts[vLength]] = vPos
+			vStarts[vLength] += 1
+		}
+		return vOrder
 	}
 
 	// returns a copy with array/dictionary capacity trimmed to the content.
@@ -395,41 +420,105 @@ struct IndexState {
 	}
 }
 
+// RecordStore scans by folder, shared by IndexState and snapshots
+extension RecordStore {
+
+	// positions of the records covered by inMatcher (the folders and
+	// everything below them). Reads records in place, chunk by chunk, and
+	// reuses the answer while consecutive records share a parent folder.
+	func positions(coveredBy inMatcher: SubtreeMatcher) -> [Int] {
+		var vResult: [Int] = []
+		var vLastParent = ""
+		var vLastInside = false
+		for vChunkIndex in 0..<chunkCount {
+			let vBase = vChunkIndex << RecordStore.kShift
+			chunk(at: vChunkIndex).withUnsafeBufferPointer { vBuffer in
+				for vI in vBuffer.indices {
+					let vParent = vBuffer[vI].parentPath
+					if vParent != vLastParent {
+						vLastInside = inMatcher.containsChild(inParentPath: vParent)
+						vLastParent = vParent
+					}
+					if vLastInside || inMatcher.isRoot(inId: vBuffer[vI].id) {
+						vResult.append(vBase + vI)
+					}
+				}
+			}
+		}
+		return vResult
+	}
+}
+
 // SubtreeMatcher answers "is this entry at or below one of these
 // directories?" using byte-level prefix checks on the parent path, so the
 // O(n) passes over the index don't allocate a full path per record.
+// The folders are kept as a sorted list of non-nested "path/" prefixes, so
+// a check is a binary search: removing thousands of folders at once (a
+// test suite cleaning up) costs O(log k) per record instead of O(k).
 struct SubtreeMatcher {
 
-	// root directories without trailing slash ("/" kept as is)
-	private let roots: [String]
-	// roots with a trailing slash, for descendant checks
+	// the byte "/"
+	private static let kSlash: UInt8 = 0x2F
+
+	// minimal folders as "path/" bytes ("/" alone for the root), sorted
 	private let prefixes: [[UInt8]]
-	// record ids of the roots themselves
+	// record ids of the folders themselves
 	private let rootIds: Set<UInt64>
 
 	// builds a matcher for the given directory paths
 	init(inRoots: [String]) {
-		roots = inRoots.map { ($0.count > 1 && $0.hasSuffix("/")) ? String($0.dropLast()) : $0 }
-		prefixes = roots.map { Array(($0 == "/" ? "/" : $0 + "/").utf8) }
-		rootIds = Set(roots.map { FileRecord.pathHash($0) })
+		let vRoots = inRoots.map(Self.normalized)
+		rootIds = Set(vRoots.map { FileRecord.pathHash($0) })
+		prefixes = Self.minimalPrefixes(inPaths: vRoots).map { $0.bytes }
 	}
 
-	// true if a record whose parent is inParentPath lies below a root
-	// (the root directory's own record is matched by isRoot instead)
+	// true when there is no folder to match
+	var isEmpty: Bool { prefixes.isEmpty }
+
+	// true if a record whose parent is inParentPath lies below a folder
+	// (the folder's own record is matched by isRoot instead)
 	func containsChild(inParentPath: String) -> Bool {
-		for (vI, vRoot) in roots.enumerated() {
-			if inParentPath == vRoot { return true }
-			if inParentPath.utf8.starts(with: prefixes[vI]) { return true }
-		}
-		return false
+		guard !prefixes.isEmpty else { return false }
+		var vParent = inParentPath
+		return vParent.withUTF8 { containsChild(inParentBytes: $0) }
 	}
 
-	// true if the record is one of the roots itself
+	// containsChild on the parent path's bytes. The parent is below a
+	// folder when "parent/" starts with "folder/". Among non-nested
+	// prefixes, only the greatest one sorting at or before "parent/" can
+	// be such a prefix (everything between a prefix and a string it starts
+	// would start with it too, i.e. be nested in it).
+	private func containsChild(inParentBytes: UnsafeBufferPointer<UInt8>) -> Bool {
+		var vLow = 0
+		var vHigh = prefixes.count
+		while vLow < vHigh {
+			let vMid = (vLow + vHigh) / 2
+			if Self.compare(inPrefix: prefixes[vMid], inParent: inParentBytes) <= 0 {
+				vLow = vMid + 1
+			} else {
+				vHigh = vMid
+			}
+		}
+		guard vLow > 0 else { return false }
+		let vPrefix = prefixes[vLow - 1]
+		guard vPrefix.count <= inParentBytes.count + 1 else { return false }
+		for vI in 0..<vPrefix.count where vPrefix[vI] != Self.byte(at: vI, of: inParentBytes) {
+			return false
+		}
+		return true
+	}
+
+	// true if the record is one of the folders itself
 	func isRoot(inRecord: FileRecord) -> Bool {
 		return rootIds.contains(inRecord.id)
 	}
 
-	// true if the record is one of the roots or lies below one
+	// true if the record id is one of the folders'
+	func isRoot(inId: UInt64) -> Bool {
+		return rootIds.contains(inId)
+	}
+
+	// true if the record is one of the folders or lies below one
 	func covers(inRecord: FileRecord) -> Bool {
 		return isRoot(inRecord: inRecord) || containsChild(inParentPath: inRecord.parentPath)
 	}
@@ -437,13 +526,44 @@ struct SubtreeMatcher {
 	// removes duplicates and paths nested under another path of the list,
 	// so overlapping subtrees are only walked once
 	static func minimalRoots(inPaths: [String]) -> [String] {
-		var vResult: [String] = []
-		for vPath in Set(inPaths).sorted(by: { $0.utf8.count < $1.utf8.count }) {
-			let vCovered = vResult.contains { vRoot in
-				vRoot == "/" || vPath == vRoot || vPath.hasPrefix(vRoot + "/")
-			}
-			if !vCovered { vResult.append(vPath) }
+		return minimalPrefixes(inPaths: inPaths.map(normalized)).map { $0.path }
+	}
+
+	// the non-nested paths among inPaths with their "path/" bytes, sorted
+	// by those bytes: a path nested in another sorts right after it, so one
+	// sweep comparing with the last kept path drops them all
+	private static func minimalPrefixes(inPaths: [String]) -> [(path: String, bytes: [UInt8])] {
+		let vSorted = Set(inPaths)
+			.map { (path: $0, bytes: $0 == "/" ? [kSlash] : Array($0.utf8) + [kSlash]) }
+			.sorted { $0.bytes.lexicographicallyPrecedes($1.bytes) }
+		var vResult: [(path: String, bytes: [UInt8])] = []
+		for vEntry in vSorted {
+			if let vLast = vResult.last, vEntry.bytes.starts(with: vLast.bytes) { continue }
+			vResult.append(vEntry)
 		}
 		return vResult
+	}
+
+	// inPath without a trailing slash ("/" kept as is)
+	private static func normalized(_ inPath: String) -> String {
+		return (inPath.utf8.count > 1 && inPath.hasSuffix("/")) ? String(inPath.dropLast()) : inPath
+	}
+
+	// byte inIndex of "parent/" (the slash is virtual: no allocation)
+	@inline(__always)
+	private static func byte(at inIndex: Int, of inParent: UnsafeBufferPointer<UInt8>) -> UInt8 {
+		return inIndex < inParent.count ? inParent[inIndex] : kSlash
+	}
+
+	// orders inPrefix against "parent/": negative, zero or positive
+	private static func compare(inPrefix: [UInt8], inParent: UnsafeBufferPointer<UInt8>) -> Int {
+		let vParentCount = inParent.count + 1
+		let vCount = min(inPrefix.count, vParentCount)
+		for vI in 0..<vCount {
+			let vA = inPrefix[vI]
+			let vB = byte(at: vI, of: inParent)
+			if vA != vB { return vA < vB ? -1 : 1 }
+		}
+		return inPrefix.count - vParentCount
 	}
 }

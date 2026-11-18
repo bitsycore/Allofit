@@ -274,10 +274,19 @@ enum ServiceInstaller {
 		}
 	}
 
-	// resolves an absolute path to the currently running binary
+	// resolves the absolute path of the binary to install as the service
 	private static func resolveBinaryPath() throws -> String {
-		// the loaded executable, not argv[0] (which a caller can set to
-		// anything, including a relative path)
+		// the bundle's service helper: the same binary, signed on its own
+		// so its signature stays valid once copied out (see build-app.sh)
+		let vHelper = Bundle.main.bundleURL
+			.appendingPathComponent("Contents/Helpers/Allofit Service")
+			.resolvingSymlinksInPath()
+		if vHelper.path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: vHelper.path) {
+			return vHelper.path
+		}
+		// otherwise (a build run outside a bundle) the loaded executable,
+		// not argv[0] (which a caller can set to anything, including a
+		// relative path)
 		if let vUrl = Bundle.main.executableURL?.resolvingSymlinksInPath(),
 		   vUrl.path.hasPrefix("/"),
 		   FileManager.default.fileExists(atPath: vUrl.path) {

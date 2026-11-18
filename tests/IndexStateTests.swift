@@ -229,6 +229,67 @@ struct IndexStateTests {
 		#expect(vRoots.sorted() == ["/a", "/a b/c", "/c"])
 	}
 
+	@Test func subtreeMatcherAgreesWithPrefixChecks() {
+		// names chosen so that siblings share prefixes and sort around "/"
+		let vNames = ["a", "b", "a b", "a-b", "a.b", "ab", "\u{00E9}", "a/b"]
+		var vGenerator = SystemRandomNumberGenerator()
+		func randomPath() -> String {
+			let vDepth = Int.random(in: 1...4, using: &vGenerator)
+			return "/" + (0..<vDepth).map { _ in vNames.randomElement(using: &vGenerator)! }.joined(separator: "/")
+		}
+		for _ in 0..<50 {
+			let vFolders = (0..<Int.random(in: 1...40, using: &vGenerator)).map { _ in randomPath() }
+			let vMatcher = SubtreeMatcher(inRoots: vFolders)
+			for _ in 0..<200 {
+				let vParent = randomPath()
+				let vExpected = vFolders.contains { vParent == $0 || vParent.hasPrefix($0 + "/") }
+				#expect(vMatcher.containsChild(inParentPath: vParent) == vExpected, "\(vParent) in \(vFolders)")
+			}
+		}
+		#expect(SubtreeMatcher(inRoots: ["/"]).containsChild(inParentPath: "/anything"))
+		#expect(SubtreeMatcher(inRoots: ["/a/"]).containsChild(inParentPath: "/a"))
+		#expect(!SubtreeMatcher(inRoots: ["/a/b"]).containsChild(inParentPath: "/a/b-c"))
+		#expect(!SubtreeMatcher(inRoots: []).containsChild(inParentPath: "/a"))
+	}
+
+	@Test func removingThousandsOfFoldersIsFast() {
+		// a test suite deleting its 5,000 temp folders from a large index
+		var vRecords: [FileRecord] = [Self.dir("/r")]
+		for vI in 0..<5_000 {
+			vRecords.append(Self.dir("/r/tmp\(vI)"))
+			vRecords.append(Self.file("/r/tmp\(vI)/out.txt"))
+		}
+		for vI in 0..<200_000 {
+			vRecords.append(Self.file("/r/src/f\(vI)"))
+		}
+		var vState = IndexState(inRecords: vRecords)
+		var vChanges = ResolvedChanges()
+		vChanges.removals = (0..<5_000).map { "/r/tmp\($0)" }
+		let vStart = Date()
+		_ = vState.apply(inChanges: vChanges, inRoots: ["/r"])
+		let vSeconds = Date().timeIntervalSince(vStart)
+		#expect(vState.count == 200_001)
+		// was several seconds with one prefix check per folder per record
+		#expect(vSeconds < 2, "took \(vSeconds) s")
+	}
+
+	@Test func pruneOfALargeIndexIsFast() {
+		// 300,000 entries in 3,000 folders, one excluded folder
+		var vRecords: [FileRecord] = [Self.dir("/r")]
+		for vFolder in 0..<3_000 {
+			vRecords.append(Self.dir("/r/d\(vFolder)"))
+			for vFile in 0..<100 {
+				vRecords.append(Self.file("/r/d\(vFolder)/f\(vFile)"))
+			}
+		}
+		var vState = IndexState(inRecords: vRecords)
+		let vStart = Date()
+		let vRemoved = vState.prune(inRoots: ["/r"], inExclusions: ExclusionMatcher(inExclusions: ["/r/d7"]))
+		let vSeconds = Date().timeIntervalSince(vStart)
+		#expect(vRemoved == 101)
+		#expect(vSeconds < 3, "took \(vSeconds) s")
+	}
+
 	@Test func topSelectionMatchesFullSort() {
 		let vRecords = (0..<5000).map { Self.file("/r/f\($0 % 977)-\($0).txt", size: Int64(($0 * 7919) % 1013)) }
 		let vPositions = (0..<Int32(vRecords.count)).map { $0 }

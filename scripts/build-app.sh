@@ -9,6 +9,11 @@
 #     ALLOFIT_VERSION=1.0.0 ./scripts/build-app.sh # env var still works
 #
 # Version precedence: --version arg > ALLOFIT_VERSION env > default 0.0.0.
+#
+# Signing: with ALLOFIT_SIGN_IDENTITY set (e.g. "Developer ID Application:
+# Name (TEAMID)", a certificate in the keychain), the bundle is signed with
+# it, with the hardened runtime and a secure timestamp, as notarization
+# requires. Without it, the bundle is signed ad hoc (fine for local use).
 # The produced bundle ends up at <project root>/outputs/Allofit-<version>.app
 # (the version is appended so multiple builds can coexist in outputs/).
 #
@@ -112,6 +117,14 @@ while read -r vRpath; do
 	install_name_tool -delete_rpath "${vRpath}" "${vMacOSDir}/${kAppName}"
 done < <(otool -l "${vMacOSDir}/${kAppName}" | awk '/cmd LC_RPATH/{getline; getline; print $2}' | grep -v '^/usr/lib' || true)
 chmod +x "${vMacOSDir}/${kAppName}"
+
+# the background service runs a copy of the binary named "Allofit Service"
+# (so it stands apart in Activity Monitor). A binary copied out of a signed
+# bundle loses its valid signature, so the bundle carries its own copy,
+# signed on its own as a standalone tool, that the installer copies out
+vHelpersDir="${vAppBundle}/Contents/Helpers"
+mkdir -p "${vHelpersDir}"
+cp "${vMacOSDir}/${kAppName}" "${vHelpersDir}/${kAppName} Service"
 
 # ==================
 # MARK: Resolve icon
@@ -275,10 +288,24 @@ cat > "${vAppBundle}/Contents/PkgInfo" <<EOF
 APPL????
 EOF
 
-# ad-hoc sign so Gatekeeper accepts the bundle when launched from Finder.
-# For wider distribution you'd swap "-" for your Developer ID identity.
-echo "==> Ad-hoc code signing"
-codesign --force --sign - "${vAppBundle}" 2>/dev/null || true
+# signed inside out: the service helper first, then the bundle sealing it
+vEntitlements="${vProjectRoot}/scripts/${kAppName}.entitlements"
+vHelper="${vHelpersDir}/${kAppName} Service"
+if [[ -n "${ALLOFIT_SIGN_IDENTITY:-}" ]]; then
+	echo "==> Signing with ${ALLOFIT_SIGN_IDENTITY}"
+	codesign --force --timestamp --options runtime \
+		--identifier "${kBundleId}.service" \
+		--sign "${ALLOFIT_SIGN_IDENTITY}" "${vHelper}"
+	codesign --force --timestamp --options runtime \
+		--entitlements "${vEntitlements}" \
+		--sign "${ALLOFIT_SIGN_IDENTITY}" "${vAppBundle}"
+	codesign --verify --strict --deep --verbose=2 "${vAppBundle}"
+else
+	# ad hoc: Gatekeeper accepts it when built and launched on this Mac
+	echo "==> Ad-hoc code signing (set ALLOFIT_SIGN_IDENTITY to sign for distribution)"
+	codesign --force --identifier "${kBundleId}.service" --sign - "${vHelper}"
+	codesign --force --entitlements "${vEntitlements}" --sign - "${vAppBundle}"
+fi
 
 echo
 echo "Built ${vAppBundle}"

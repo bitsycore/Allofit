@@ -105,10 +105,15 @@ hdiutil create \
 	-format UDZO \
 	"${vDmgPath}" >/dev/null
 
-# ad-hoc sign so Gatekeeper doesn't add an extra layer of confusion when
-# the user double-clicks the .dmg. The .app inside is already signed.
-echo "==> Ad-hoc code signing the DMG"
-codesign --force --sign - "${vDmgPath}" 2>/dev/null || true
+# signed like the app (see build-app.sh): with ALLOFIT_SIGN_IDENTITY for
+# distribution, ad hoc otherwise. The .app inside is already signed.
+if [[ -n "${ALLOFIT_SIGN_IDENTITY:-}" ]]; then
+	echo "==> Signing the DMG with ${ALLOFIT_SIGN_IDENTITY}"
+	codesign --force --timestamp --sign "${ALLOFIT_SIGN_IDENTITY}" "${vDmgPath}"
+else
+	echo "==> Ad-hoc code signing the DMG"
+	codesign --force --sign - "${vDmgPath}" 2>/dev/null || true
+fi
 
 echo
 echo "Built ${vDmgPath}"
